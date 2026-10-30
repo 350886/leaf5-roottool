@@ -827,7 +827,7 @@ python tools/fetch_deps.py --no-zadig
 | `assets/zadig.exe` | [libwdi v1.5.1 → zadig-2.9.exe](https://github.com/pbatard/libwdi/releases/download/v1.5.1/zadig-2.9.exe) | ✅ 可选 | `4ecaa95df3da3621486a043aef8b3050b8bafe7c901402871e816229ef82039b` |
 | `assets/lito_op_n10_fhprg.bin` | [bkerler/Loaders → op_n10](https://raw.githubusercontent.com/bkerler/Loaders/main/oneplus/0013f0e100515198_2354228eebcbc203_fhprg_op_n10.bin) | ✅ | `6558f49c3a55d0eb7fdd7bb326c9bb22b29f4b6b6316937e847e8b76e11f6ec0` |
 | `assets/lito_moto_fhprg.bin` | [bkerler/Loaders → moto lito](https://raw.githubusercontent.com/bkerler/Loaders/main/lenovo_motorola/0013f0e102e80000_628be3f403d0c67a_fhprg.bin)（文件名前缀就是 HWID `0013f0e1` + OEM `02e8`） | ✅ 可选 | `1b5fa0ac18e3ac136aac184bf36d4ef02ad1819ccadc14214b97ce00326e20c1` |
-| `assets/payload/preload.so` | 编译产物 —— EXE 装好后先跑一次「内核适配向导」现编，见下 | ❌ | `5acbe2003ea451f575bb6a9be07f2b0d75218103cd91f2ef5a34467fd823bd6e` |
+| `assets/payload/preload.so` | 编译产物 —— 装好 EXE 后向导现编，产物在包外、**不用重打 EXE**，见下 | ❌ | `5acbe2003ea451f575bb6a9be07f2b0d75218103cd91f2ef5a34467fd823bd6e` |
 | `assets/payload/device_root.sh` | 已在仓库里（纯文本脚本） | — | `3724942215bfc91c45feeeebe7952b28c777e87c21ec6dbe48684ed51d320c92` |
 
 `assets/exploit_src/exploit/` 是 C 源码树，`build.py:sync_exploit()` 每次
@@ -838,7 +838,10 @@ python tools/fetch_deps.py --no-zadig
 **`preload.so` 是编出来的，不是下下来的。** 62 个偏移只对「原厂 4.2.3 + 这一版
 `target.h`」成立，别人机器编出来的是另一份，拷过来跑不了。
 
-### 装好 EXE，第一次先跑「内核适配向导」
+### 装好 EXE，第一次先跑「内核适配向导」（不用重打 EXE）
+
+**这一步跟「重新编译 Leaf5RootTool.exe」没关系。** 向导只产出 `preload.so` 一个文件，
+落在包外，工具下次启动自己去捡 —— 不重打也生效。
 
 别急着点「一键全自动」：
 
@@ -847,7 +850,7 @@ python tools/fetch_deps.py --no-zadig
 3. 产物落在 `%LOCALAPPDATA%\Leaf5RootTool\targets\<id>\preload.so`，带设备指纹
 4. 回主界面，遇到同指纹的设备会自动选这份，不用再指定
 
-**这一步不需要重新打包 EXE。** 适配结果是包外的一个目录，APP 每次部署都重新扫：
+适配结果是包外的一个目录，APP 每次部署都重新扫：
 传进来的载荷 → `targets\` 里指纹/符号序列对得上的 → 都没命中才用包内
 `assets/payload/preload.so`（`roottool.py:751-788`）。所以内置那份不准也照样能跑，
 向导补上就行。
@@ -875,7 +878,7 @@ Leaf5RootTool.exe --edl dump -o out_dump      # 产出 out_dump\boot_b.img
 `-o` 是**目录**不是文件名，输出固定叫 `boot_a.img` / `boot_b.img`（按实际槽位）。
 完整流程（定槽位 → 进 9008 → printgpt → 读分区 → reset）见「内核适配」那节。
 
-### 只有从源码重新打 EXE，才要往 assets 里放一份
+### 只有想把 .so 一起打进 EXE 里，才需要重打一次
 
 `build.py:142` 检查 `assets/payload/` 下两个文件在不在，因为那是打进包里的兜底。
 顺序反过来走一遍：
