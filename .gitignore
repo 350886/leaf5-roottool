@@ -14,8 +14,11 @@ venv/
 # ── 第三方二进制，不进仓库 ──────────────────────────────────────────
 # 来源与 sha256 见 README「assets 里的二进制不进仓库」那张表。
 # 少了这几个 build.py 会直接报路径，不会打出半成品。
-assets/adb/
-assets/magisk/
+# 目录本身留着（.gitkeep），省得 clone 下来还要先 mkdir。
+assets/adb/*
+!assets/adb/.gitkeep
+assets/magisk/*
+!assets/magisk/.gitkeep
 assets/zadig.exe
 assets/*.bin
 assets/payload/preload.so

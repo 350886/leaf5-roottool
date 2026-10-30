@@ -573,8 +573,8 @@ pip install pyinstaller pyusb pyserial libusb-package docopt capstone colorama
 
 ### assets 里的二进制不进仓库
 
-体积 + 授权两个原因。按下面这张表自己放进 `assets/` 对应位置，`build.py`
-开头会逐个检查，缺哪个直接报路径：
+体积 + 授权两个原因。目录已经在仓库里（`.gitkeep` 占位），按下面这张表自己
+放进去就行 —— `build.py` 开头会逐个检查，缺哪个直接报路径：
 
 | 放哪 | 从哪拿 | sha256 |
 |---|---|---|
