@@ -1,6 +1,6 @@
 # Leaf5 Root Tool
 
-ONYX BOOX Leaf5 的一键 root 客户端。内嵌 adb，不依赖机器上装没装 platform-tools。
+ONYX BOOX Leaf5 的一键 root 客户端。内嵌 adb，不依赖机器上装没装 [platform-tools](https://developer.android.com/tools/releases/platform-tools)。
 
 > **只对一台机器成立**：ONYX BOOX Leaf5 / 固件 `4.2.3-rel_0928_656b72278` /
 > 内核 `4.19.157-perf-g77c132eccfab-dirty` #38。
@@ -379,7 +379,9 @@ adb shell getprop ro.boot.flash.locked        # 期望 0
 programmer 就能按 GPT 表读任意分区。**不需要 root，也不需要 OTA 包或固件包。**
 
 Leaf5 是 SM6350（lito），实测用 OnePlus N10 的 lito programmer 就能加载
-（同 SoC 家族的通用 firehose 实现）。
+（同 SoC 家族的通用 firehose 实现）。那份 programmer 在
+[bkerler/Loaders](https://github.com/bkerler/Loaders) 里，文件名
+`0013f0e100515198_2354228eebcbc203_fhprg_op_n10.bin`，`tools/fetch_deps.py` 自动下。
 
 ```bash
 python edlman.py env      # 检查 edl 工具 / programmer / 9008 在线
@@ -407,8 +409,9 @@ super    off=0x034080000  len=0x180000000
 **窗口期只有一次**：读出来的镜像必须过一遍 banner 校验（见下一节）。
 A/B 设备上 `boot_b` 可能是上一个固件版本，读错槽等于偏移全错。
 
-依赖都在外部，不打包进 EXE：`bkerler/edl`（USB 通信）+ `lito_*_fhprg.bin`
-（programmer）+ Windows 上给 `QUSB_BULK`（05C6:9008）绑 WinUSB（Zadig）。
+依赖都在外部，不打包进 EXE：[bkerler/edl](https://github.com/bkerler/edl)（USB 通信）
++ firehose programmer（[bkerler/Loaders](https://github.com/bkerler/Loaders) 里那份 `lito_op_n10_fhprg.bin`）
++ Windows 上给 `QUSB_BULK`（05C6:9008）绑 WinUSB（[Zadig](https://github.com/pbatard/libwdi/releases/tag/v1.5.1)）。
 路径用环境变量覆盖：
 
 ```bash
@@ -552,7 +555,9 @@ AppData、Program Files、node_modules 等）直接跳过。故意不收 `.txt`�
 1. **内核** — 打开向导时已自动填好；要换就点「候选」「浏览…」，
    或用「从设备读符号」直接拉一份
 2. **等 NDK** — 本机有 Android SDK 就直接复用（自动扫 `ANDROID_HOME` /
-   `%LOCALAPPDATA%\Android\Sdk`）；没有就点「下载 NDK」，约 700 MB，
+   `%LOCALAPPDATA%\Android\Sdk`）；没有就点「下载 NDK」
+   （[ndkman.py](ndkman.py) 按 r29 → r27c 试
+   [Google 的 NDK 包](https://developer.android.com/ndk/downloads)），约 700 MB，
    解压 3.6 GB，完事自动裁剪到 1.6 GB（只删 sources、另两个平台的 prebuilt 之类，
    `bin/` 一个文件不动）
 3. **生成 target.h** — 自动提 55 个符号偏移，写出 `targets/migr-xxxx/target.h`
@@ -725,7 +730,7 @@ Leaf5RootTool.exe --edl dump -o out_dump      # 产出 out_dump\boot_b.img
 完整流程（定槽位 → 进 9008 → printgpt → 读分区 → reset）见「内核适配」那节。
 
 **`lito_moto_fhprg.bin` 是可选的**。`loader_candidates()` 里
-`lito_op_n10_fhprg.bin` 排第一且实测通过，摩托那份只是兜底；bkerler/Loaders
-全库按 sha256 前 16 位搜过，没有这一份，只能从对应机型的固件包里解。缺了不影响
-9008 通路。
+[`lito_op_n10_fhprg.bin`](https://raw.githubusercontent.com/bkerler/Loaders/main/oneplus/0013f0e100515198_2354228eebcbc203_fhprg_op_n10.bin) 排第一且实测通过，摩托那份只是兜底；
+[bkerler/Loaders](https://github.com/bkerler/Loaders) 全库按 sha256
+前 16 位搜过，没有这一份，只能从对应机型的固件包里解。缺了不影响 9008 通路。
 
