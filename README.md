@@ -706,7 +706,7 @@ python tools/fetch_deps.py --no-zadig
 | `assets/zadig.exe` | [libwdi v1.5.1 → zadig-2.9.exe](https://github.com/pbatard/libwdi/releases/download/v1.5.1/zadig-2.9.exe) | ✅ 可选 | `4ecaa95df3da3621486a043aef8b3050b8bafe7c901402871e816229ef82039b` |
 | `assets/lito_op_n10_fhprg.bin` | [bkerler/Loaders → op_n10](https://raw.githubusercontent.com/bkerler/Loaders/main/oneplus/0013f0e100515198_2354228eebcbc203_fhprg_op_n10.bin) | ✅ | `6558f49c3a55d0eb7fdd7bb326c9bb22b29f4b6b6316937e847e8b76e11f6ec0` |
 | `assets/lito_moto_fhprg.bin` | 无公开源，见下 | ❌ 可选 | `1b5fa0ac18e3ac136aac184bf36d4ef02ad1819ccadc14214b97ce00326e20c1` |
-| `assets/payload/preload.so` | 编译产物，见下 | ❌ | `5acbe2003ea451f575bb6a9be07f2b0d75218103cd91f2ef5a34467fd823bd6e` |
+| `assets/payload/preload.so` | 编译产物 —— EXE 装好后先跑一次「内核适配向导」现编，见下 | ❌ | `5acbe2003ea451f575bb6a9be07f2b0d75218103cd91f2ef5a34467fd823bd6e` |
 | `assets/payload/device_root.sh` | 已在仓库里（纯文本脚本） | — | `3724942215bfc91c45feeeebe7952b28c777e87c21ec6dbe48684ed51d320c92` |
 
 `assets/exploit_src/exploit/` 是 C 源码树，`build.py:sync_exploit()` 每次
@@ -714,20 +714,62 @@ python tools/fetch_deps.py --no-zadig
 [350886/leaf5-ghostlock](https://github.com/350886/leaf5-ghostlock)）同步过来，
 已有副本可以直接用。
 
-**`preload.so` 只能自己产**。它是编译产物，62 个偏移只对「原厂 4.2.3 + 这一版
-`target.h`」成立，别人的机器编出来的是另一份，直接拷过来跑不了。两条路：
+**`preload.so` 是编出来的，不是下下来的。** 62 个偏移只对「原厂 4.2.3 + 这一版
+`target.h`」成立，别人机器编出来的是另一份，拷过来跑不了。
+
+### 装好 EXE，第一次先跑「内核适配向导」
+
+别急着点「一键全自动」：
+
+1. 主界面点「内核适配向导」
+2. 五步走完：选内核 → 等 NDK → 生成 `target.h` → 填 4 个值 → 编译装进工具
+3. 产物落在 `%LOCALAPPDATA%\Leaf5RootTool\targets\<id>\preload.so`，带设备指纹
+4. 回主界面，遇到同指纹的设备会自动选这份，不用再指定
+
+**这一步不需要重新打包 EXE。** 适配结果是包外的一个目录，APP 每次部署都重新扫：
+传进来的载荷 → `targets\` 里指纹/符号序列对得上的 → 都没命中才用包内
+`assets/payload/preload.so`（`roottool.py:751-788`）。所以内置那份不准也照样能跑，
+向导补上就行。
+
+自己这台要不要编，先看内核串：
 
 ```bash
-# ① 设备已经 root：直接跑一次「内核适配向导」，它读 /proc/kallsyms、
-#    生成 target.h、调 NDK 现编，全程不用下固件包
+adb shell uname -r
+```
+
+回 `4.19.157-perf-g77c132eccfab-dirty` 说明和内置那份对得上，编出来应与它逐字节
+一致；不是这个串就必须现编，否则偏移是错的。
+
+内核怎么来，分两条路：
+
+```bash
+# ① 设备已经 root：向导第 1 步点「从设备读符号」
+#    它 su 进设备读 /proc/kallsyms，不需要固件包
 
 # ② 设备还没 root：先用上面那个 programmer 进 9008 读 boot
 Leaf5RootTool.exe --edl dump -o out_dump      # 产出 out_dump\boot_b.img
-#    然后在「内核适配向导」里选这个 boot_b.img —— 它反解符号后调 NDK 现编
+#    然后在向导里选这个 boot_b.img —— 它反解符号后调 NDK 现编
 ```
 
 `-o` 是**目录**不是文件名，输出固定叫 `boot_a.img` / `boot_b.img`（按实际槽位）。
 完整流程（定槽位 → 进 9008 → printgpt → 读分区 → reset）见「内核适配」那节。
+
+### 只有从源码重新打 EXE，才要往 assets 里放一份
+
+`build.py:142` 检查 `assets/payload/` 下两个文件在不在，因为那是打进包里的兜底。
+顺序反过来走一遍：
+
+```bash
+python tools/fetch_deps.py        # 先拉齐其它六件
+python roottool.py                # 还没有 EXE 时，用源码起界面
+#   点「内核适配向导」→ 编完 → 产物在 targets\<id>\preload.so
+
+cp "%LOCALAPPDATA%\Leaf5RootTool\targets\<id>\preload.so" assets\payload\preload.so
+python build.py --sign
+```
+
+也就是说 **EXE 里那份，是上一次跑适配向导的产出**。别人的产物别往自己包里塞 ——
+`target.h` 不同，那份 `.so` 只在他那台机器上跑得对。
 
 **`lito_moto_fhprg.bin` 是可选的**。`loader_candidates()` 里
 [`lito_op_n10_fhprg.bin`](https://raw.githubusercontent.com/bkerler/Loaders/main/oneplus/0013f0e100515198_2354228eebcbc203_fhprg_op_n10.bin) 排第一且实测通过，摩托那份只是兜底；
