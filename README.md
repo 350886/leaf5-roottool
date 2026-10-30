@@ -38,6 +38,9 @@ ONYX BOOX Leaf5 的一键 root 客户端。内嵌 adb，不依赖机器上装没
 | 数据线 | USB 连接，已在「开发者选项」里打开 **USB 调试** |
 | 授权 | 第一次连会在屏幕上弹「允许 USB 调试」，点允许 |
 
+**别的机型、别的内核能不能用** → 见下面「[能 root 哪些设备](#能-root-哪些设备)」。
+同一次内核构建出来的机器，载荷是通用的。
+
 ### 型号或内核对不上会直接停下
 
 `1.1.3` 起是硬拦，不是警告。检测阶段读 `ro.product.model` 和 `uname -r`，
@@ -67,6 +70,77 @@ ONYX BOOX Leaf5 的一键 root 客户端。内嵌 adb，不依赖机器上装没
 （勾了 Magisk）读 `boot_b`、打 Magisk patch、`dd` 写回分区。这四步里
 前两步偏移错了是 kernel panic，第三步错了是写坏 boot，第四步错了是开不了机。
 都不是"再点一次就好"的量级。
+
+---
+
+## 能 root 哪些设备
+
+「前置条件」那张表是**开箱即用**的范围 —— 一个字节不改、点一下就成的只有那一台。
+它不是"全部能跑"的范围。
+
+载荷选哪一份，判据是**内核符号序列**，不是机型（`adapter.py` 的 `pick_payload()`）：
+
+```
+① 符号名序列哈希一致   → 同一次内核构建，直接拿来用（最可信）
+② 设备指纹一致
+③ 内核版本串一致       → 同版本不同构建，次优
+```
+
+62 个偏移全是「符号地址 − `_text`」的差值，4 个手工常量是结构体布局与栈帧大小，
+只跟内核镜像有关；`device_root.sh` 只碰 `/system/bin/sleep` 和 `/data/local/tmp`，
+不读任何机型属性。**所以同一次内核构建出来的机器，载荷本身是通用的。**
+
+### 分档
+
+| 设备 | 内核 | 能到什么程度 | 要做什么 |
+|---|---|---|---|
+| Leaf5 | `4.19.157-perf-g77c132eccfab-dirty` #38 | 全部，含 Magisk 持久化 | 不用做，开箱 |
+| Leaf5 | 同内核，换了固件（4.2.4 之类） | 临时 root 直接能；Magisk 大概率要重定位补丁点 | 先只跑临时 root 验证；`services.jar` 另核 |
+| Leaf5 | 4.19.157 的其他 build（串里仍含 `4.19.157`） | 重编载荷后能 | 跑「内核适配向导」，手填 4 个宏 |
+| Leaf5 | 4.19.200 / 5.4 / 6.1 | 向导编得出来，能不能过要实跑；5.x 起结构变了，成功率低 | 同上，门槛更高；先只跑临时 root |
+| ONYX 其他机型 | **整串相同的内核** | 临时 root 能（载荷会被自动选中）；Magisk 看下面两条 | 勾「跳过型号核对」；验 `services.jar` |
+| ONYX 其他机型 | 不同内核 | 要重新适配 | 向导重编 + 4 个值；SoC 变了还要换 EDL programmer |
+| 非 ONYX | — | 不适用 | 链子本身是通用的，但机型常量、分区布局、sepolicy 全要重做 |
+
+### 同内核、不同机型：只有三处会变
+
+| 部分 | 为什么变 | 工具怎么兜 |
+|---|---|---|
+| `services.jar` 的 DEX 补丁点 `0x2b2fee` | 跟**系统固件**走，不跟内核走；不同机型 framework 不同 | 字节不符直接抛 `AdbError` 停下（`roottool.py:238`），不写坏。后果是 Magisk App 启动 NPE，root 本身正常 |
+| boot 分区 | A-only / A/B、header 参数不同 | 只读 kernel/ramdisk size + `hdr_ver`（`roottool.py:141`）；实际 patch 由设备上的 `magiskboot` 做，不吃硬编码 page_size。槽位读 `ro.boot.slot_suffix`，读不到回退 `/proc/cmdline`（`autopilot.py:201`） |
+| SELinux 策略 | 各机型 sepolicy 不同 | exploit round1 要转 permissive。**这是最可能卡住的一步** |
+
+EDL 那条支路（只有「没 root 又要读 boot」才用）按 HW_ID 分，同内核通常同 SoC 平台，
+programmer 大概率仍可用；`--edl gpt` 一跑就知道。
+
+### 自己先判
+
+```bash
+adb shell uname -r              # 整串比对，不是"都写着 4.19.157"就行
+adb shell getprop ro.product.model
+Leaf5RootTool.exe --check       # 不动设备，只打读数
+```
+
+### 建议顺序（前两步都可逆）
+
+```bash
+# 1. 只跑临时 root，不勾 Magisk —— 零写入，重启就恢复
+Leaf5RootTool.exe --auto --force-model
+
+# 2. 过了再核 services.jar 补丁点（读出来看，不改）
+adb shell su -c "cp /system/framework/services.jar /data/local/tmp/s.jar"
+#    解压看 classes.dex 0x2b2fee 处是不是 38 01 33 00
+
+# 3. 前两步都过，才勾 Magisk 动 boot
+```
+
+第 1 步过不了就别往下 —— 那是偏移或 sepolicy 的问题，硬上 Magisk 只会把 boot 写坏。
+
+### 别指望闸门替你判断
+
+闸门判据是 `TARGET_MODEL not in model and "TabBoox" not in model`
+（`roottool.py:570`）。Leaf5 自己的 `ro.product.model` 就是 `TabBoox`，ONYX 也有别的
+机型报这个值 —— **这些机器不会被拦**，工具照常往下推载荷。还是先跑 `--check` 自己确认。
 
 ---
 
