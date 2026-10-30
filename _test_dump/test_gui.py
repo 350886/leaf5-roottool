@@ -2,7 +2,9 @@
 """
 GUI 冒烟：窗口 withdraw 后构建，只验控件能建起来、文案对不对，不显示窗口。
 
-  "C:/Users/thelu/AppData/Local/Programs/Python/Python312/python.exe" _test_dump/test_gui.py
+  python _test_dump/test_gui.py
+
+要用带 tkinter 的那个解释器跑（微软商店精简版没有）。
 """
 import os
 import sys

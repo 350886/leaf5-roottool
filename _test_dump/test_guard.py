@@ -2,7 +2,7 @@
 """
 guard 闸门的离线自测：不接设备，用假 adb 跑 stage_detect + guard 全流程。
 
-  E:/BOOX/edl-venv/Scripts/python.exe _test_dump/test_guard.py
+  python _test_dump/test_guard.py
 """
 import os
 import queue
