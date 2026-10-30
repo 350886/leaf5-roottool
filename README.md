@@ -525,18 +525,28 @@ python adapter.py list
 roottool.py             主程序（GUI + 流程）
 adapter.py              内核适配流水线（解 vmlinux / 提符号 / 生成 target.h / 编译）
 adapter_ui.py           适配向导窗口
+autopilot.py            一键全自动的编排层（等设备 → 适配 → 编译）
 fp.py                   无 root 设备指纹采集与匹配（符号名序列哈希）
 imageksym.py            裸 ARM64 Image 的 kallsyms 反解（token 表 + 偏移数组）
 a64.py                  极简 ARM64 解码器（只为推 TASK_CRED_OFF / PRCTL_FRAME_TOTAL）
-autopilot.py            一键全自动的编排层（等设备 → 适配 → 编译）
-edlman.py               9008 只读分区导出（不需要 root 的取镜像路径）
 elfsyms.py              纯标准库 ELF64 符号表解析 + kallsyms 文本解析
 ndkman.py               NDK 查找 / 下载 / 解压 / 校验 / 裁剪
+drivers.py              Zadig 驱动引导（新机器缺 WinUSB 时）
 build.py                打包脚本
-assets/adb/             内嵌 adb.exe + 两个 dll
-assets/payload/         preload.so（exploit 载荷）、device_root.sh（设备端自持）
-assets/magisk/          Magisk APK，运行时从中提取工具
-assets/exploit_src/     exploit 源码树，适配向导现编 preload.so 用
+
+edlmain.py              firehose 协议层（USB / 串口 / 网络三种后端）
+edllink.py              9008 会话封装（programmer 选择、4MB 分块读、校验重读）
+edlman.py               EDL 子命令：env / slot / gpt / dump / r
+usbtrace.py             USB 侧实况，绕开 adb 直接问 SetupAPI
+edlclient/              vendored 的 bkerler/edl（去了 .git，只留 Library/Config/Tools）
+
+assets/                 运行时资源
+  exploit_src/          exploit 源码树，适配向导现编 preload.so 用（在仓库里）
+  payload/device_root.sh 设备端自持脚本（在仓库里）
+  adb/ magisk/ *.bin zadig.exe payload/preload.so   ← 自己按下面的表放
+
+build/                  PyInstaller 的 spec 与版本资源
+_test_dump/             guard 闸门与 GUI 的离线自测（不接设备也能跑）
 ```
 
 运行时会在 `%LOCALAPPDATA%\Leaf5RootTool\` 下铺 `bin\`（adb）、`logs\`、
