@@ -162,6 +162,8 @@ classes.dex 0x2b2fee : 38 01 33 00  →  38 01 3F 00
 
 补丁点上的原字节不是 `38 01 33 00` 时**直接拒绝**，不会瞎改 —— 换固件要重算偏移。
 
+模块在 Magisk 里长什么样、怎么验证生效、怎么停用，见下面「Magisk 里的 Leaf5 模块」。
+
 ---
 
 ## 命令行
@@ -207,6 +209,99 @@ CLI 输出同时写一份 UTF-8 日志到
 
 ⚠ 判断 `CAP_SYS_ADMIN` 要看 route 日志里的 `bnd=`，**不要看 exec 后的 `CapEff`** ——
 这个内核 `execve` 的 `pP'` 落在 inheritable 上，`CapEff` 只是 `CapInh` 的镜像。
+
+---
+
+## Magisk 里的 Leaf5 模块（`boox-ams-fix`）
+
+装完 Magisk 后，Magisk App 的「模块」列表里会多出这一条：
+
+| 字段 | 值 |
+|---|---|
+| 名称 | `Boox AMS NPE Fix (Leaf5 4.2.3)` |
+| ID | `boox-ams-fix` |
+| 版本 | `v1.0-leaf5-4.2.3` |
+| 作者 | `leaf5-roottool` |
+| 落盘 | `/data/adb/modules/boox-ams-fix/` |
+
+**它只做一件事**：把打过补丁的 `services.jar` 用 Magisk 的 magic mount 盖到
+`/system/framework/services.jar` 上面。模块目录里只有两个文件：
+
+```
+/data/adb/modules/boox-ams-fix/
+├── module.prop                     模块信息（上面那张表的来源）
+└── system/framework/services.jar   打过补丁的那份
+```
+
+**为什么必须走模块**：`/system` 是 dm-verity 保护的 dm-linear（`/dev/block/dm-8`），
+有 `CAP_SYS_ADMIN` 也 remount 不成可写。magic mount 不碰分区内容，只在挂载层叠一份 ——
+随时能撤，这是它唯一比「直接改系统」强的地方。
+
+### 不装会怎样
+
+root 本身不受影响，`su -c id` 照样是 `uid=0`。坏的是 **Magisk App 打不开**：
+一点就卡在启动图，或者闪一下退回桌面。
+
+根因在 ONYX 的 `ActivityManagerService.addPackageDependency`：
+
+```
+AOSP : if (proc == null) return;
+ONYX : if (proc == null) → 跳去自己的 WebView 使用追踪
+                           → iget-object v0, v1, ProcessRecord;->info
+                             v1 为 null ⇒ NPE
+```
+
+Magisk 的 root 守护进程由 `app_process` 拉起、不在 PidMap 里，`proc` 恒为 null，
+所以每次启动都落进这个分支。程序装完会执行一次 `pm enable com.topjohnwu.magisk`，
+那只解决 ONYX 把 App 冻结成 `enabled=3` 的问题，跟这个 NPE 是两回事。
+
+### 怎么确认它真的生效
+
+```bash
+adb shell su -c 'cat /data/adb/modules/boox-ams-fix/module.prop'
+adb shell su -c 'ls /data/adb/modules/boox-ams-fix/system/framework/'
+
+# 重启之后，被挂载的那份应该和模块里那份逐字节一致
+adb shell su -c 'md5sum /system/framework/services.jar                  /data/adb/modules/boox-ams-fix/system/framework/services.jar'
+```
+
+两个 md5 相同就是 magic mount 生效了。不同的话按这个顺序查：
+
+- `/data/adb/modules/boox-ams-fix/` 下有没有 `disable` 文件 —— 有就是被停用了
+- `/data/adb/magisk/busybox` 在不在 —— 缺了 `setup_magisk_env` 会 abort，
+  `post-fs-data` 提前返回，**所有**模块都不挂载，不只这一个
+- Magisk App 里显示「已移除」但目录还在，说明模块是开机后才铺的，再重启一次
+
+### 不要了怎么退
+
+```bash
+# 停用：下次开机不再挂载，目录保留，随时能开回来
+adb shell su -c 'touch /data/adb/modules/boox-ams-fix/disable'
+
+# 彻底删除
+adb shell su -c 'rm -rf /data/adb/modules/boox-ams-fix'
+```
+
+两种都要重启才生效。删掉之后 Magisk App 会重新卡在启动图 —— 那是回到原厂行为，
+不是把系统搞坏了。
+
+### 补丁点
+
+`classes.dex` 里一个 4 字节改动（`roottool.py:107-109`）：
+
+```
+0x2b2fee : 38 01 33 00  →  38 01 3F 00
+           if-eqz v1, +0x33        if-eqz v1, +0x3F（方法尾部唯一的 return-void）
+```
+
+改完必须重算 DEX 头两个校验，ART 只认这两个，漏一个就拒绝加载：
+
+| 字段 | 偏移 | 算法 |
+|---|---|---|
+| `checksum` | `0x08:0x0C` | Adler32 over `[12:]` |
+| `signature` | `0x0C:0x20` | SHA-1 over `[32:]` |
+
+补丁点上的原字节不是 `38 01 33 00` 时程序直接拒绝，不会硬改 —— 换固件要重算偏移。
 
 ---
 
