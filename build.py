@@ -25,7 +25,7 @@ NAME = "Leaf5RootTool"
 # 带 Google Play 的版本单独一个名字 —— 两个 EXE 要能并排放，
 # 用户一眼看出哪个不用带 apk 文件夹
 GP_NAME = "Leaf5RootTool_gplay"
-VERSION = (1, 1, 3, 0)
+VERSION = (1, 1, 4, 0)
 
 ADB = ["adb.exe", "AdbWinApi.dll", "AdbWinUsbApi.dll"]
 PAYLOAD = ["preload.so", "device_root.sh"]
