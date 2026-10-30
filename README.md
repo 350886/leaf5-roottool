@@ -214,7 +214,7 @@ CLI 输出同时写一份 UTF-8 日志到
 
 ## Magisk 里的 Leaf5 模块（`boox-ams-fix`）
 
-装完 Magisk 后，Magisk App 的「模块」列表里会多出这一条：
+装完 Magisk 后，Magisk App 的「模块」列表里会多出一条 **`Boox AMS NPE Fix (Leaf5 4.2.3)`**：
 
 | 字段 | 值 |
 |---|---|
