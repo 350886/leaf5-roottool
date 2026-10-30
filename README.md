@@ -307,6 +307,11 @@ launch_store()      am start -W + 等 3 秒 + 读 topResumedActivity，两个判
 `enable()` 把这些串成一条，返回固定字段的 dict（`ok` / `stage` / `detail` / `need_manual`），
 `stage` 一共五种：`installed` / `launched` / `need_login` / `blocked` / `failed`。
 
+**已经装了但拉不起来时会自动换包重试一次**（`reinstall_if_blocked=True`，UI 和 `--gplay` 都开）。
+这一条是给 44.x 准备的：那个版本在 Leaf5 上装得上、一开就退，
+手上有 42.x 的包就直接覆盖换上，比让人去猜"为什么有账号还是 blocked"省事。
+没开这个开关就只探测不动设备。
+
 ### APK 放哪
 
 商店包 64 MB，**不打进 EXE**（会把 37 MB 撑到 100 MB）。工具按这个顺序找，取体积最大的那个：
@@ -320,6 +325,10 @@ launch_store()      am start -W + 等 3 秒 + 读 topResumedActivity，两个判
 
 文件名含 `vending` 或 `Phonesky`、扩展名 `.apk` 就会被认出来。
 一次找不到会直接把该放哪几个目录打在报错里，不用猜。
+
+打包好的 `dist\apk\` 里已经放了一份 `Phonesky_42.0.18-31.apk`。
+**把 EXE 挪到别的机器用时，`apk` 文件夹要一起拷过去** —— 只拷 EXE 的话，
+商店没装的设备会停在"没找到商店 APK"这一步。
 
 版本选 **Google Play Store 42.x / 44.x，SDK 31+，arm64-v8a，nodpi**。
 44.6.15 在 Leaf5 上装得上但一开就退；42.0.18-31 实测能用。

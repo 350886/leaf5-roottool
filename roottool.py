@@ -1551,7 +1551,7 @@ def cli_main(args):
                 else os.path.dirname(os.path.abspath(__file__)))
         g = gplay.Gp(adb, base_dir=base, log=lambda s: emit("  " + s))
         try:
-            r = g.enable(apk=args.apk)
+            r = g.enable(apk=args.apk, reinstall_if_blocked=True)
         except gplay.GpError as e:
             emit(f"[-] {e}")
             return 3
@@ -2199,7 +2199,7 @@ class App:
             try:
                 g = gplay.Gp(self.adb, base_dir=base,
                              log=lambda s: self.q.put(("log", "  " + s, "dim")))
-                r = g.enable()
+                r = g.enable(reinstall_if_blocked=True)
             except Exception as e:
                 r = {"ok": False, "stage": "failed",
                      "detail": f"{type(e).__name__}: {e}",

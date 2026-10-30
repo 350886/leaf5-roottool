@@ -253,9 +253,14 @@ class Gp:
         top = self.top_activity()
         return (top == STORE_PKG), top, blob
 
-    def enable(self, apk=None, install_if_missing=True, settle=SETTLE):
+    def enable(self, apk=None, install_if_missing=True, settle=SETTLE,
+               reinstall_if_blocked=False):
         """
         编排：装（缺才装）-> 拉起 -> 不行就引导登录 -> 再拉起。
+
+        reinstall_if_blocked：已装但拉不起来时，用 apk 目录里那个包覆盖重装再试一次。
+        默认关（纯探测不该动设备）；UI 里开，因为 44.x 装得上但一开就退，
+        手上有 42.x 的包就该直接换上，而不是让人去重登账号。
 
         返回 dict，字段固定，UI 直接照着渲染：
             {
@@ -297,12 +302,39 @@ class Gp:
                        detail=f"商店已在运行 {st.store_version}")
             return res
 
+        # 3b. 换成包外那个 APK 再试一次。
+        #     实测 44.6.15 在 Leaf5 上装得上、一开就退；42.0.18-31 正常。
+        #     这里有包就换，比让人去猜"为什么有账号还是 blocked"省事得多。
+        if reinstall_if_blocked:
+            try:
+                cand = self.find_apk(apk)
+            except GpError:
+                cand = None
+            if cand:
+                ok, msg = self.install(cand)
+                if ok:
+                    running, top, blob = self.launch_store(settle=settle)
+                    if running:
+                        newst = self.probe()
+                        res["state"] = newst
+                        res.update(ok=True, stage="launched",
+                                   detail=f"用 {os.path.basename(cand)} 覆盖重装后起来了"
+                                          f"（{newst.store_version}）")
+                        return res
+                    gone = ("\n覆盖重装也没起来，前台是 " + (top or "未知"))
+                else:
+                    gone = "\n覆盖重装失败：" + msg.strip()[:200]
+            else:
+                gone = ""
+        else:
+            gone = ""
+
         # 4. 拉不起来。已经登录过账号还拉不起来 = 真被拦（或者是别的原因），
         #    没账号 = 缺的正是 ONYX 那一步登录。
         if st.accounts:
             res.update(stage="blocked", need_manual=True,
                        detail=("商店起不来，但 Google 账号已在：" + ", ".join(st.accounts) +
-                               "\n前台是 " + (top or "未知") +
+                               "\n前台是 " + (top or "未知") + gone +
                                "\n可能 gms_enable 还没写进去：去 设置 -> 账号 -> 重新登录一次 Google 账号完成验证"))
             return res
 

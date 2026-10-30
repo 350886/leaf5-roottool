@@ -211,6 +211,50 @@ try:
 except gp.GpError as e:
     ck("放到这些目录" in str(e), "GpError 给出放置目录", str(e))
 
+print("== 13. 已装但起不来 + 手上有包 -> 覆盖重装后起来了 ==")
+d = tempfile.mkdtemp()
+os.makedirs(os.path.join(d, "apk"))
+open(os.path.join(d, "apk", "Phonesky_42.0.18-31.apk"), "wb").write(b"x" * 4096)
+adb = FakeAdb(packages={gp.STORE_PKG, gp.GMS_PKG, gp.GSF_PKG},
+              versions={gp.STORE_PKG: "44.6.15"},
+              accounts=["theluck.blue@gmail.com"],
+              store_top="com.android.launcher3")
+_orig = adb.run
+def run_fix(args, timeout=20):
+    out = _orig(args, timeout)
+    if args[0] == "install":
+        # 装回 42.x 之后商店就能起来了
+        adb.store_top = gp.STORE_PKG
+        adb.versions[gp.STORE_PKG] = "42.0.18-31"
+    return out
+adb.run = run_fix
+r = new_gp(adb, base=d).enable(settle=0, reinstall_if_blocked=True)
+ck(r["ok"] and r["stage"] == "launched", "重装后 launched", r)
+ck("覆盖重装" in r["detail"], "detail 说明是重装救回来的", r["detail"])
+ck("42.0.18-31" in r["detail"], "detail 带重装后的版本", r["detail"])
+
+print("== 14. 同一场景但不开 reinstall -> 保持 blocked ==")
+adb = FakeAdb(packages={gp.STORE_PKG, gp.GMS_PKG, gp.GSF_PKG},
+              versions={gp.STORE_PKG: "44.6.15"},
+              accounts=["theluck.blue@gmail.com"],
+              store_top="com.android.launcher3")
+r = new_gp(adb, base=d).enable(settle=0)
+ck(r["stage"] == "blocked", "不开重装 -> blocked", r)
+ck(not any(c[0] == "run" and c[1][0] == "install" for c in adb.calls),
+   "一个 install 都没调")
+
+print("== 15. 重装也失败 -> detail 带上失败原因 ==")
+d2 = tempfile.mkdtemp()
+os.makedirs(os.path.join(d2, "apk"))
+open(os.path.join(d2, "apk", "vending.apk"), "wb").write(b"x" * 4096)
+adb = FakeAdb(packages={gp.STORE_PKG, gp.GMS_PKG, gp.GSF_PKG},
+              versions={gp.STORE_PKG: "42.0.18-31"},
+              accounts=["a@gmail.com"],
+              store_top="com.android.launcher3", install_ok=False)
+r = new_gp(adb, base=d2).enable(settle=0, reinstall_if_blocked=True)
+ck(r["stage"] == "blocked", "仍是 blocked", r)
+ck("覆盖重装失败" in r["detail"], "detail 带重装失败原因", r["detail"])
+
 print()
 print(f"通过 {OK} 项" + (f"，失败 {len(BAD)} 项：{BAD}" if BAD else "，全部通过"))
 sys.exit(1 if BAD else 0)
