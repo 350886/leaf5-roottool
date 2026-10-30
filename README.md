@@ -966,7 +966,7 @@ assets/                 运行时资源
   payload/device_root.sh 设备端自持脚本（在仓库里）
   adb/ magisk/ apk/ *.bin zadig.exe payload/preload.so   ← 自己按下面的表放
 
-build/                  PyInstaller 的 spec 与版本资源
+build/                  PyInstaller 工作目录（spec / 版本资源 / 中间树），生成物不进仓库
 _test_dump/             guard 闸门与 GUI 的离线自测（不接设备也能跑）
 ```
 
