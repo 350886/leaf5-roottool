@@ -1,0 +1,1 @@
+{"supported_functions": ["program", "read", "nop", "patch", "configure", "setbootablestoragedrive", "erase", "power", "firmwarewrite", "getstorageinfo", "benchmark", "emmc", "ufs", "fixgpt", "getsha256digest", "eraseuserdata", "setprocstart", "setswprojmodel", "setswprojmodel", "setprocstart"], "programmer": "assets/lito_op_n10_fhprg.bin", "serial": 582537126}
