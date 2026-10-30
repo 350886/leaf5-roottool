@@ -690,7 +690,7 @@ python tools/fetch_deps.py --check   # 只看缺什么，不下载
 python tools/fetch_deps.py --no-zadig
 ```
 
-能自动下的有六件：adb 三件、Magisk、`lito_op_n10_fhprg.bin`、zadig。
+能自动下的有七件：adb 三件、Magisk、`lito_op_n10_fhprg.bin`、`lito_moto_fhprg.bin`、zadig。
 下完立即校验，对不上就删掉报错 —— 不会留下一个"看着在、其实是 404 页面"的文件。
 `adb` 钉的是 platform-tools **r37.0.0**（`-latest` 会漂移，r37.0.1 的三个文件
 哈希与下面这组全都不同，实测过）。
@@ -705,7 +705,7 @@ python tools/fetch_deps.py --no-zadig
 | `assets/magisk/Magisk-v31.1.apk` | [Magisk v31.1](https://github.com/topjohnwu/Magisk/releases/download/v31.1/Magisk-v31.1.apk) | ✅ | `89cefac0a318afa39fb3880c45c87b036c05bc1ebf02a7a715b7f8d7c26ac6e7` |
 | `assets/zadig.exe` | [libwdi v1.5.1 → zadig-2.9.exe](https://github.com/pbatard/libwdi/releases/download/v1.5.1/zadig-2.9.exe) | ✅ 可选 | `4ecaa95df3da3621486a043aef8b3050b8bafe7c901402871e816229ef82039b` |
 | `assets/lito_op_n10_fhprg.bin` | [bkerler/Loaders → op_n10](https://raw.githubusercontent.com/bkerler/Loaders/main/oneplus/0013f0e100515198_2354228eebcbc203_fhprg_op_n10.bin) | ✅ | `6558f49c3a55d0eb7fdd7bb326c9bb22b29f4b6b6316937e847e8b76e11f6ec0` |
-| `assets/lito_moto_fhprg.bin` | 无公开源，见下 | ❌ 可选 | `1b5fa0ac18e3ac136aac184bf36d4ef02ad1819ccadc14214b97ce00326e20c1` |
+| `assets/lito_moto_fhprg.bin` | [bkerler/Loaders → moto lito](https://raw.githubusercontent.com/bkerler/Loaders/main/lenovo_motorola/0013f0e102e80000_628be3f403d0c67a_fhprg.bin)（文件名前缀就是 HWID `0013f0e1` + OEM `02e8`） | ✅ 可选 | `1b5fa0ac18e3ac136aac184bf36d4ef02ad1819ccadc14214b97ce00326e20c1` |
 | `assets/payload/preload.so` | 编译产物 —— EXE 装好后先跑一次「内核适配向导」现编，见下 | ❌ | `5acbe2003ea451f575bb6a9be07f2b0d75218103cd91f2ef5a34467fd823bd6e` |
 | `assets/payload/device_root.sh` | 已在仓库里（纯文本脚本） | — | `3724942215bfc91c45feeeebe7952b28c777e87c21ec6dbe48684ed51d320c92` |
 
@@ -771,8 +771,17 @@ python build.py --sign
 也就是说 **EXE 里那份，是上一次跑适配向导的产出**。别人的产物别往自己包里塞 ——
 `target.h` 不同，那份 `.so` 只在他那台机器上跑得对。
 
-**`lito_moto_fhprg.bin` 是可选的**。`loader_candidates()` 里
-[`lito_op_n10_fhprg.bin`](https://raw.githubusercontent.com/bkerler/Loaders/main/oneplus/0013f0e100515198_2354228eebcbc203_fhprg_op_n10.bin) 排第一且实测通过，摩托那份只是兜底；
-[bkerler/Loaders](https://github.com/bkerler/Loaders) 全库按 sha256
-前 16 位搜过，没有这一份，只能从对应机型的固件包里解。缺了不影响 9008 通路。
+**`lito_moto_fhprg.bin` 从哪来**：就是
+[bkerler/Loaders](https://github.com/bkerler/Loaders) 里
+`lenovo_motorola/0013f0e102e80000_628be3f403d0c67a_fhprg.bin`。
+文件名前半段 `0013f0e1` 是 HW_ID、`02e8` 是 OEM_ID —— 与 Leaf5 要的
+`HW_ID 0013F0E1` 一字不差，所以它能在 Leaf5 上跑起来；后半段
+`628be3f403d0c67a` 是这枚 firehose 自己的构建指纹。
+
+它是 Motorola PKI 签的（`strings` 里能看到 `Motorola Attestation CA 719`），
+EDL 的 firehose 握手只认 HW_ID、不校验签名方，所以与 OnePlus 那份同样能用。
+两份体积不同（759,536 vs 765,440 字节），差的是各自的证书链。
+
+`loader_candidates()` 里 op_n10 那份排第一（实测通过），摩托这份只是兜底；
+`fetch_deps.py` 会把它一起下。缺了不影响 9008 通路。
 

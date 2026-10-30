@@ -84,6 +84,19 @@ DEPS = [
         note="OnePlus N10 (SM6350/lito) firehose programmer，来自 bkerler/Loaders",
     ),
     dict(
+        name="fhprg_moto",
+        kind="file",
+        # 文件名前缀就是 HWID+OEM_ID：0013f0e1 / 02e8 —— 与 Leaf5 的
+        # 0x0013F0E1（SM6350 lito）完全相同，也是本地那份的原始出处。
+        # 同一目录里 98 个 moto blob，只有这一个是 0x13F0E1。
+        url=("https://raw.githubusercontent.com/bkerler/Loaders/main/"
+             "lenovo_motorola/0013f0e102e80000_628be3f403d0c67a_fhprg.bin"),
+        dest="assets/lito_moto_fhprg.bin",
+        sha="1b5fa0ac18e3ac136aac184bf36d4ef02ad1819ccadc14214b97ce00326e20c1",
+        optional=True,
+        note="Motorola lito（同 HWID 0x13F0E1）firehose programmer，兜底用",
+    ),
+    dict(
         name="zadig",
         kind="file",
         # zadig.akeo.ie/downloads/ 已经 404，官方现在的下载点在 libwdi 的
@@ -104,12 +117,6 @@ NOT_DOWNLOADABLE = [
             "它会取 kallsyms、生成 target.h、调 NDK 现编；"
             "② 没有 root 就用上面那个 programmer 进 9008，"
             "`--edl dump boot` 取镜像后反解。",
-    ),
-    dict(
-        path="assets/lito_moto_fhprg.bin",
-        why="可选备份。bkerler/Loaders 全库按 sha256 前 16 位搜过，没有这一份；"
-            "它是 loader_candidates() 里排第二的兜底，缺了不影响 —— "
-            "op_n10 那份排第一且实测通过。",
     ),
 ]
 
