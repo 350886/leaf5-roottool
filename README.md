@@ -655,10 +655,14 @@ _test_dump/             guard 闸门与 GUI 的离线自测（不接设备也能
 ## 自己重新打包
 
 ```bash
-python build.py            # 单文件，产物 dist/Leaf5RootTool.exe
-python build.py --sign     # 打包后签名
-python build.py --onedir   # 目录版，启动快
+python tools/fetch_deps.py   # 拉齐 assets 下缺的二进制（带 sha256 校验）
+python build.py              # 单文件，产物 dist/Leaf5RootTool.exe
+python build.py --sign       # 打包后签名
+python build.py --onedir     # 目录版，启动快
 ```
+
+`build.py` 缺文件时会直接报路径，并区分「能自动下的」和「只能自己产的」
+—— 前者一条 `fetch_deps.py` 解决，后者是 `preload.so`。
 
 必须用带 tkinter 的 64 位 Python（微软商店那个精简版没有，PyInstaller
 不会报错，会安安静静打出一个启动就崩的包）。
@@ -671,27 +675,57 @@ pip install pyinstaller pyusb pyserial libusb-package docopt capstone colorama
 
 ### assets 里的二进制不进仓库
 
-体积 + 授权两个原因。目录已经在仓库里（`.gitkeep` 占位），按下面这张表自己
-放进去就行 —— `build.py` 开头会逐个检查，缺哪个直接报路径：
+体积 + 授权两个原因。目录已经在仓库里（`.gitkeep` 占位）。两条路：
 
-| 放哪 | 从哪拿 | sha256 |
-|---|---|---|
-| `assets/adb/adb.exe` | [platform-tools](https://developer.android.com/tools/releases/platform-tools) | `957e46b8615f7af5b7292a2ddabe98d2e61940c3fb2b0545756507f080613e71` |
-| `assets/adb/AdbWinApi.dll` | 同上 | `120bef587119c6cb926b86b9be90fdfbce38937588eae28cd91a94ce63c7b965` |
-| `assets/adb/AdbWinUsbApi.dll` | 同上 | `6ca69a2ca0e31309c087d288f058977d421ad03500e4c3e1dbd981241a069c60` |
-| `assets/magisk/Magisk-v31.1.apk` | [Magisk Release](https://github.com/topjohnwu/Magisk/releases) | `89cefac0a318afa39fb3880c45c87b036c05bc1ebf02a7a715b7f8d7c26ac6e7` |
-| `assets/zadig.exe` | [zadig.akeo.ie](https://zadig.akeo.ie/) | `20e4cd7b6768718848f603fe928f36e207dc5ca96fc9db7085d841410d0abae4` |
-| `assets/lito_op_n10_fhprg.bin` | ONYX Leaf5 固件包里的 firehose programmer | `6558f49c3a55d0eb7fdd7bb326c9bb22b29f4b6b6316937e847e8b76e11f6ec0` |
-| `assets/lito_moto_fhprg.bin` | 摩托罗拉 lito 平台（同 SoC，作 9008 备份） | `1b5fa0ac18e3ac136aac184bf36d4ef02ad1819ccadc14214b97ce00326e20c1` |
-| `assets/payload/preload.so` | 跑一次「内核适配向导」现编，或从 Release 附件取 | `5acbe2003ea451f575bb6a9be07f2b0d75218103cd91f2ef5a34467fd823bd6e` |
-| `assets/payload/device_root.sh` | 已在仓库里（纯文本脚本） | `3724942215bfc91c45feeeebe7952b28c777e87c21ec6dbe48684ed51d320c92` |
+**自动**（推荐）：
+
+```bash
+python tools/fetch_deps.py           # 缺什么下什么，逐件 sha256 校验
+python tools/fetch_deps.py --check   # 只看缺什么，不下载
+python tools/fetch_deps.py --no-zadig
+```
+
+能自动下的有六件：adb 三件、Magisk、`lito_op_n10_fhprg.bin`、zadig。
+下完立即校验，对不上就删掉报错 —— 不会留下一个"看着在、其实是 404 页面"的文件。
+`adb` 钉的是 platform-tools **r37.0.0**（`-latest` 会漂移，r37.0.1 的三个文件
+哈希与下面这组全都不同，实测过）。
+
+**手动**：按下面这张表自己放 —— `build.py` 开头会逐个检查，缺哪个直接报路径：
+
+| 放哪 | 从哪拿 | 自动 | sha256 |
+|---|---|---|---|
+| `assets/adb/adb.exe` | [platform-tools r37.0.0](https://dl.google.com/android/repository/platform-tools_r37.0.0-win.zip) | ✅ | `957e46b8615f7af5b7292a2ddabe98d2e61940c3fb2b0545756507f080613e71` |
+| `assets/adb/AdbWinApi.dll` | 同上（zip 里 `platform-tools/`） | ✅ | `120bef587119c6cb926b86b9be90fdfbce38937588eae28cd91a94ce63c7b965` |
+| `assets/adb/AdbWinUsbApi.dll` | 同上 | ✅ | `6ca69a2ca0e31309c087d288f058977d421ad03500e4c3e1dbd981241a069c60` |
+| `assets/magisk/Magisk-v31.1.apk` | [Magisk v31.1](https://github.com/topjohnwu/Magisk/releases/download/v31.1/Magisk-v31.1.apk) | ✅ | `89cefac0a318afa39fb3880c45c87b036c05bc1ebf02a7a715b7f8d7c26ac6e7` |
+| `assets/zadig.exe` | [libwdi v1.5.1 → zadig-2.9.exe](https://github.com/pbatard/libwdi/releases/download/v1.5.1/zadig-2.9.exe) | ✅ 可选 | `4ecaa95df3da3621486a043aef8b3050b8bafe7c901402871e816229ef82039b` |
+| `assets/lito_op_n10_fhprg.bin` | [bkerler/Loaders → op_n10](https://raw.githubusercontent.com/bkerler/Loaders/main/oneplus/0013f0e100515198_2354228eebcbc203_fhprg_op_n10.bin) | ✅ | `6558f49c3a55d0eb7fdd7bb326c9bb22b29f4b6b6316937e847e8b76e11f6ec0` |
+| `assets/lito_moto_fhprg.bin` | 无公开源，见下 | ❌ 可选 | `1b5fa0ac18e3ac136aac184bf36d4ef02ad1819ccadc14214b97ce00326e20c1` |
+| `assets/payload/preload.so` | 编译产物，见下 | ❌ | `5acbe2003ea451f575bb6a9be07f2b0d75218103cd91f2ef5a34467fd823bd6e` |
+| `assets/payload/device_root.sh` | 已在仓库里（纯文本脚本） | — | `3724942215bfc91c45feeeebe7952b28c777e87c21ec6dbe48684ed51d320c92` |
 
 `assets/exploit_src/exploit/` 是 C 源码树，`build.py:sync_exploit()` 每次
 打包前从 `EXPLOIT_REPO`（默认 `../leaf5-ghostlock/exploit`，见
 [350886/leaf5-ghostlock](https://github.com/350886/leaf5-ghostlock)）同步过来，
 已有副本可以直接用。
 
-两条 `fhprg.bin` 没有公开直链 —— ONYX 那份在官方固件包里，摩托罗拉那份在
-同 SoC 机型的固件包里，都得自己解。没有它们 9008 通路直接断（自动适配读不了
-boot 分区），但**不影响已经 root 的机器**。
+**`preload.so` 只能自己产**。它是编译产物，62 个偏移只对「原厂 4.2.3 + 这一版
+`target.h`」成立，别人的机器编出来的是另一份，直接拷过来跑不了。两条路：
+
+```bash
+# ① 设备已经 root：直接跑一次「内核适配向导」，它读 /proc/kallsyms、
+#    生成 target.h、调 NDK 现编，全程不用下固件包
+
+# ② 设备还没 root：先用上面那个 programmer 进 9008 读 boot
+Leaf5RootTool.exe --edl dump -o out_dump      # 产出 out_dump\boot_b.img
+#    然后在「内核适配向导」里选这个 boot_b.img —— 它反解符号后调 NDK 现编
+```
+
+`-o` 是**目录**不是文件名，输出固定叫 `boot_a.img` / `boot_b.img`（按实际槽位）。
+完整流程（定槽位 → 进 9008 → printgpt → 读分区 → reset）见「内核适配」那节。
+
+**`lito_moto_fhprg.bin` 是可选的**。`loader_candidates()` 里
+`lito_op_n10_fhprg.bin` 排第一且实测通过，摩托那份只是兜底；bkerler/Loaders
+全库按 sha256 前 16 位搜过，没有这一份，只能从对应机型的固件包里解。缺了不影响
+9008 通路。
 

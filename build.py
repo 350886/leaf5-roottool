@@ -160,6 +160,16 @@ def main():
         print("[-] 缺文件：")
         for m in missing:
             print("    ", m)
+        print()
+        # 分两类提示：能自动下的、只能自己产的。混在一起说，新手会去翻固件包
+        fetchable = [m for m in missing
+                     if not m.endswith("preload.so")
+                     and os.path.basename(m) not in ("edlclient", "edlmain.py")]
+        if fetchable:
+            print("    第三方二进制不进仓库，一条命令拉齐（带 sha256 校验）：")
+            print("        python tools/fetch_deps.py")
+        if any(m.endswith("preload.so") for m in missing):
+            print("    preload.so 是编译产物，不在拉取清单里 —— 跑一次「内核适配向导」现编。")
         return 2
 
     src_dir = sync_exploit()
