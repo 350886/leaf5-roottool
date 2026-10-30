@@ -8,6 +8,9 @@ ONYX BOOX Leaf5 的一键 root 客户端。内嵌 adb，不依赖机器上装没
 > `services.jar` 的补丁点全是硬编码的，换一版内核就是 kernel panic。
 > 换了固件的机器请先用「内核适配向导」重新生成载荷。
 
+漏洞链本身（C 源码、偏移推导、手工命令行流程）在 **[350886/leaf5-ghostlock](https://github.com/350886/leaf5-ghostlock)**；
+本仓库是它的 Windows 封装 —— 加上 adb、EDL、载荷适配和 Magisk 安装。
+
 双击 `Leaf5RootTool.exe`，点「一键全自动」。剩下的它自己走：
 
 ```
@@ -589,7 +592,8 @@ pip install pyinstaller pyusb pyserial libusb-package docopt capstone colorama
 | `assets/payload/device_root.sh` | 已在仓库里（纯文本脚本） | `3724942215bfc91c45feeeebe7952b28c777e87c21ec6dbe48684ed51d320c92` |
 
 `assets/exploit_src/exploit/` 是 C 源码树，`build.py:sync_exploit()` 每次
-打包前从 `EXPLOIT_REPO`（默认 `../leaf5-ghostlock/exploit`）同步过来，
+打包前从 `EXPLOIT_REPO`（默认 `../leaf5-ghostlock/exploit`，见
+[350886/leaf5-ghostlock](https://github.com/350886/leaf5-ghostlock)）同步过来，
 已有副本可以直接用。
 
 两条 `fhprg.bin` 没有公开直链 —— ONYX 那份在官方固件包里，摩托罗拉那份在
