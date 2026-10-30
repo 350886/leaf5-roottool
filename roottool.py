@@ -449,6 +449,24 @@ class ModelMismatch(Exception):
     pass
 
 
+class AlreadyRooted(Exception):
+    """
+    设备上已经有可用的 su，没有必要再跑一遍。
+
+    跟 ModelMismatch 一样是"压根没动手"，不是"跑失败了"：抛出的位置在
+    stage_adapt / stage_deploy 之前，一个字节都没往设备写。所以上层要显示
+    成绿色提示而不是红色失败，并且问一句要不要强制重跑。
+
+    src  哪个 su 生效的（/debug_ramdisk/su 或 DEV_SU）
+    ver  Magisk 版本串（形如 31.1:MAGISK:R），非 Magisk 来路时为 None
+    """
+
+    def __init__(self, msg, src=None, ver=None):
+        super().__init__(msg)
+        self.src = src
+        self.ver = ver
+
+
 class RootWorker(threading.Thread):
     """
     在后台线程里跑完整流程，所有输出通过 queue 交给界面。
@@ -463,7 +481,7 @@ class RootWorker(threading.Thread):
     def __init__(self, adb, tries=3, require_sysadmin=False, do_deploy=True,
                  do_detect=True, q=None, payload=None, with_magisk=False,
                  with_module=False, auto_adapt=False, allow_edl=True,
-                 force_model=False):
+                 force_model=False, force_rerun=False):
         super().__init__(daemon=True)
         self.adb = adb
         self.tries = max(1, int(tries))
@@ -480,12 +498,18 @@ class RootWorker(threading.Thread):
         # 机型/内核核对：stage_detect 往里塞，guard() 在动设备之前统一拦。
         # 默认拦死 —— 推错偏移的代价是 kernel panic，不是"重跑一次"。
         self.force_model = bool(force_model)
+        # 已经 root 时仍然照跑一遍。只能由用户显式选择（界面上点了「强制重跑」/
+        # CLI 加 --force-rerun），不给任何自动路径用 —— 重复跑 exploit 没有收益。
+        self.force_rerun = bool(force_rerun)
         self.blockers = []
         self.adapted = None      # 适配成功后 Pilot 的结果
         self.dev_fp = None       # 采过一次就存着，部署阶段别再读一遍 12 万行
         self._stop = threading.Event()
         self.info = {}
         self.already_root = None
+        self.su_src = None       # 哪个 su 生效的，precheck_root 要用
+        self.magisk_ver = None
+        self.skip_exploit = False  # 已有 root 时跳过 stage_root
         self.tag = time.strftime("T%H%M%S")
 
     # -- 输出 ----------------------------------------------------------------
@@ -581,15 +605,32 @@ class RootWorker(threading.Thread):
         for b in self.blockers:
             self.log(f"  [!] {b}", "warn")
 
-        # 已经 root 就直说，别让用户白跑一轮
+        # 已经 root 就直说，别让用户白跑一轮。
+        # 这里只负责"看清事实"，拦不拦由 precheck_root 决定 —— 检测入口
+        # （--check / 界面「检测设备」）不该因为已 root 就报错。
         self.already_root = None
+        self.su_src = None
+        self.magisk_ver = None
         for cand, label in (("/debug_ramdisk/su", "Magisk"), (DEV_SU, "exploit 临时")):
             rc, out, _ = adb.run(["shell", f"{cand} -c id"], timeout=10)
-            if "uid=0" in out:
-                self.already_root = label
-                self.log(f"  [i] 这台机器已经 root（{label}，{cand}）")
-                self.log(f"      直接用 `{cand} -c <命令>` 就行，不需要再跑 exploit")
-                break
+            if "uid=0" not in out:
+                continue
+            self.already_root = label
+            self.su_src = cand
+            self.log(f"  [i] 这台机器已经 root（{label}，{cand}）")
+            if label == "Magisk":
+                # 版本串从 magisk 二进制自己问。/debug_ramdisk 不在 PATH 里，
+                # 所以先按绝对路径试，拿不到再退回裸命令。
+                for cmd in (f"{cand} -c /debug_ramdisk/magisk -v",
+                            f"{cand} -c magisk -v"):
+                    rc2, out2, _ = adb.run(["shell", cmd], timeout=10)
+                    v = (out2 or "").strip().splitlines()
+                    if v and ":" in v[0]:
+                        self.magisk_ver = v[0].strip()
+                        break
+                self.log(f"      {self.magisk_ver or '版本读不到'}")
+            self.log(f"      直接用 `{cand} -c <命令>` 就行，不需要再跑 exploit")
+            break
         return True
 
     # -- 阶段 1.2：机型闸门 --------------------------------------------------
@@ -640,6 +681,64 @@ class RootWorker(threading.Thread):
         self.log("  换了固件想正经适配：点「内核适配向导」重新生成载荷。", "warn")
         self.log("=" * 58, "warn")
         raise ModelMismatch("机型/内核不匹配，已阻止继续（要强行走加 --force-model）")
+
+    # -- 阶段 1.3：已 root 就别再跑 ------------------------------------------
+
+    def precheck_root(self):
+        """
+        设备上已经有可用 su 时，不推载荷、不跑 exploit。
+
+        为什么要单独一道，而不是让 stage_root 自己发现 —— exploit 干的事是
+        patch 内核结构体（rt_mutex_waiter 那些），拿到的是同一种 root。
+        已经有 root 再 patch 一遍没有任何收益，代价是两轮内核态竞态，
+        其中一轮挂住就是 device offline。
+
+        两条来路分开处理，因为持久性完全不同：
+          /debug_ramdisk/su  Magisk 提供，重启后还在 —— 再跑纯属多余
+          DEV_SU             exploit 自建，本次开机有效 —— 想持久化就得装 Magisk，
+                             这时候跳过 exploit 直接进 Magisk 阶段是有意义的
+
+        用户显式要求强制重跑（界面「强制重跑」/ CLI --force-rerun）时全部放行。
+        """
+        if not self.do_deploy or not self.already_root:
+            return
+
+        if self.force_rerun:
+            self.log("")
+            self.log("  [!] 已要求强制重跑 —— 设备上已有 root，照跑一遍", "warn")
+            return
+
+        src = self.su_src or (DEV_SU if self.already_root != "Magisk" else "/debug_ramdisk/su")
+        ver = self.magisk_ver or ""
+
+        if self.already_root == "Magisk":
+            head = f"设备已经是 Magisk root（{ver or '版本读不到'}，{src}）"
+            if self.with_magisk:
+                # 再 patch 一次 boot 是拿"当前已 patch 的镜像"当输入，叠补丁
+                raise AlreadyRooted(
+                    head + "\n"
+                    "勾了「安装 Magisk」，但 Magisk 已经在了 —— 再装一遍会拿当前 boot "
+                    "重新 patch 一次，叠补丁有写坏 boot 的风险。\n"
+                    "要换 Magisk 版本或重打 boot，用 Magisk App 里的「安装 → 直接安装」更稳。",
+                    src, ver or None)
+            if self.with_module:
+                self.skip_exploit = True
+                self.log("")
+                self.log(f"  [i] {head} —— 跳过 exploit，只更新 AMS 模块")
+                return
+            raise AlreadyRooted(
+                head + "，重启后依然有效，没有必要再跑一遍。", src, ver or None)
+
+        # 来路是 exploit 自建的 su：本次开机有效，重启就没了
+        if self.with_magisk:
+            self.skip_exploit = True
+            self.log("")
+            self.log("  [i] 本次开机已有临时 root —— 跳过 exploit，直接用现有 su 装 Magisk")
+            return
+        raise AlreadyRooted(
+            f"本次开机已经有临时 root（{src}），但这是 exploit 给的，重启后就没了。\n"
+            "要持久化就勾上「安装 Magisk」再点一次，会跳过 exploit 直接装。",
+            src, None)
 
     # -- 阶段 1.5：自动适配 --------------------------------------------------
 
@@ -996,14 +1095,21 @@ class RootWorker(threading.Thread):
         adb = self.adb
         self.log("")
         self.log("== 验证 ==")
-        out = adb.shell(f'{DEV_SU} -c "id"', timeout=15)
+        # 不能写死 DEV_SU：已有 Magisk root 时我们根本不跑 exploit，
+        # /data/local/tmp/su 不存在，拿它验证只会输出一片空。
+        su = self.pick_su()
+        if not su:
+            self.log("  没有可用的 su —— 验证跳过", "warn")
+            return False
+        self.log(f"  用 {su}")
+        out = adb.shell(f'{su} -c "id"', timeout=15)
         self.log(f"  {out}")
-        caps = adb.shell(f'{DEV_SU} -c "grep -E ^Cap /proc/self/status"', timeout=15)
+        caps = adb.shell(f'{su} -c "grep -E ^Cap /proc/self/status"', timeout=15)
         for line in caps.splitlines():
             self.log(f"  {line.strip()}")
-        w = adb.shell(f'{DEV_SU} -c "touch {DEV_ROOT}/root_ok && echo TOUCH_OK"', timeout=15)
+        w = adb.shell(f'{su} -c "touch {DEV_ROOT}/root_ok && echo TOUCH_OK"', timeout=15)
         self.log(f"  写 /data/local/tmp: {w}")
-        m = adb.shell(f'{DEV_SU} -c "mkdir -p {DEV_ROOT}/m && mount -t tmpfs tmpfs {DEV_ROOT}/m '
+        m = adb.shell(f'{su} -c "mkdir -p {DEV_ROOT}/m && mount -t tmpfs tmpfs {DEV_ROOT}/m '
                       f'&& echo MOUNT_OK && umount {DEV_ROOT}/m"', timeout=20)
         self.log(f"  mount tmpfs（需要 CAP_SYS_ADMIN）: {m}")
         return True
@@ -1264,12 +1370,31 @@ class RootWorker(threading.Thread):
             # 闸门必须在 stage_adapt / stage_deploy 之前：这两个阶段一个会挑载荷
             # 一个会往设备推文件，从这一步起就不再是"只看不动"了。
             self.guard()
-            self.stage_adapt()          # 便宜匹配：本地有没有同构建的载荷
-            if self.do_deploy:
+
+            if not self.do_deploy:
+                # 纯检测：界面的「检测设备」也走 run()，但它不该跑到 stage_root ——
+                # stage_root 会推载荷、在内核里开跑，那不是"检测"。到这儿已经读完
+                # 属性、核过机型、探过 su，剩下的全是"动手"，直接收工。
+                self.progress(1.0)
+                self.status("检测完成")
+                self.q.put(("done", True, {"detect_only": True,
+                                           "root": self.already_root,
+                                           "magisk": self.magisk_ver}))
+                return
+
+            self.precheck_root()        # 已有 root 在这里停，一个字节都不写设备
+            if not self.skip_exploit:
+                self.stage_adapt()      # 便宜匹配：本地有没有同构建的载荷
                 self.stage_deploy()
                 self.progress(0.10)
 
-            ok, info = self.stage_root(base=0.10, span=0.55)
+            if self.skip_exploit:
+                self.log("")
+                self.log("== 已有 root，跳过 exploit ==", "ok")
+                ok, info = True, {"reason": "跳过 exploit（设备已有 root）",
+                                  "skipped": True}
+            else:
+                ok, info = self.stage_root(base=0.10, span=0.55)
 
             # 第一轮全废 + 开了全自动 → 按设备当前内核重新做一份载荷，再来一次。
             # 这一步会读 boot 分区（只读），所以即使判断错了也不会把机器怎么样。
@@ -1327,6 +1452,16 @@ class RootWorker(threading.Thread):
             self.log("")
             self.log(f"[拦截] {e}")
             self.q.put(("done", False, {"reason": str(e), "blocked": True}))
+        except AlreadyRooted as e:
+            # 同 ModelMismatch：一个字节都没写，不是"跑失败了"。blocked 带具体
+            # 原因，界面据此弹"要不要强制重跑"而不是标红。
+            self.status("设备已 root")
+            self.log("")
+            self.log(f"[跳过] {e}")
+            self.log("")
+            self.log("  确认要重跑：界面点「强制重跑」，或命令行加 --force-rerun", "warn")
+            self.q.put(("done", False, {"reason": str(e), "blocked": "already_root",
+                                        "su": e.src, "magisk": e.ver}))
         except AdbError as e:
             self.status("出错")
             self.log("")
@@ -1427,7 +1562,8 @@ def cli_main(args):
                    with_magisk=args.magisk, with_module=args.module,
                    auto_adapt=bool(getattr(args, "auto", False)),
                    allow_edl=not getattr(args, "no_edl", False),
-                   force_model=bool(getattr(args, "force_model", False)))
+                   force_model=bool(getattr(args, "force_model", False)),
+                   force_rerun=bool(getattr(args, "force_rerun", False)))
     w.start()
     ok = False
     while w.is_alive() or not q.empty():
@@ -1471,6 +1607,8 @@ class App:
         self.port = port
         self.adb = None
         self.worker = None
+        # 一次性旗标：只在「已 root」弹窗里点了「是」之后置位，_make_worker 取走即清
+        self._force_rerun = False
         self.q = queue.Queue()
         self.devices = []
 
@@ -1697,10 +1835,54 @@ class App:
     def _on_done(self, ok, info):
         self._busy(False)
         if ok:
+            if info.get("detect_only"):
+                self._show_detect_verdict(info)
+                return
             self.set_status("已完成 —— root 可用", OK_C)
+            return
+        if info.get("blocked") == "already_root":
+            # 不是失败：一个字节都没写。用绿色 + 让人决定。
+            self.set_status("设备已 root —— 没有执行", OK_C)
+            self._offer_rerun(info)
+            return
+        reason = str(info.get("reason", "")).splitlines()
+        self.set_status(f"未完成：{reason[0]}" if reason else "未完成", BAD_C)
+
+    def _show_detect_verdict(self, info):
+        """检测收尾：把 su 的来路直接写在状态栏，别让人再去翻日志。"""
+        root = info.get("root")
+        ver = info.get("magisk") or ""
+        if root == "Magisk":
+            self.set_status(f"检测完成 —— 已 root（Magisk {ver or '版本未知'}）", OK_C)
+        elif root:
+            self.set_status(f"检测完成 —— 本次开机有临时 root（{root}），重启失效", WARN_C)
         else:
-            reason = info.get("reason", "")
-            self.set_status(f"未完成：{reason}" if reason else "未完成", BAD_C)
+            self.set_status("检测完成 —— 未 root，点「一键全自动」开始", FG_DIM)
+
+    def _offer_rerun(self, info):
+        """
+        已 root 被拦下来时的人工裁决。默认「否」—— 不动是最安全的一档。
+
+        这里必须在 worker 线程结束之后弹：done 是从队列里取的，run() 已经
+        return，所以模态框不会跟工作线程抢设备。
+        """
+        if not messagebox:
+            return
+        src = info.get("su") or ""
+        ver = info.get("magisk") or ""
+        body = (f"设备已经 root：{src}" + (f"  {ver}" if ver else "") + "\n\n"
+                "「是」＝ 照样重跑一遍（重新推载荷、跑 exploit，有内核 panic 的可能）\n"
+                "「否」＝ 什么都不做，到此为止\n\n"
+                "只想更新 AMS 修复模块：点「否」，勾上「装 AMS 修复模块」，再点一次一键 "
+                "—— 那条路会自动跳过 exploit。")
+        if messagebox.askyesno("设备已经 root", body):
+            self._force_rerun = True
+            self.log("")
+            self.log("== 按你的选择强制重跑一遍 ==", "warn")
+            self.start_one_click()
+        else:
+            self.log("")
+            self.log("已跳过：设备本来就是 root，没有需要做的事。", "ok")
 
     # -- 忙碌态 --------------------------------------------------------------
 
@@ -1831,17 +2013,62 @@ class App:
             messagebox.showerror("启不来", str(e))
 
     def refresh_targets(self):
-        """刷新"已装几份适配载荷"的提示"""
+        """刷新"已装几份适配载荷"的提示，并按有没有可用载荷调整主按钮的主次。
+
+        这一版仓库里不带 preload.so（编译产物，62 个偏移只对原厂 4.2.3 成立），
+        从源码 build 出来的人包里是空的 —— 那种情况下"一键全自动"点了必然在
+        部署那一步失败（三级回落全落空），真正该先做的是适配向导。
+        所以这里不是把向导固定排第一位（开箱即用的机器不需要它，排在前面
+        反而让人白等 700MB NDK），而是按当前有没有载荷动态调主次：
+
+            bundled      包内有 .so        → 一键为主，向导保持角落
+            targets_only 包内无、targets 目录有 → 一键可用（stage_adapt 会挑中）
+            none         两者都无            → 向导升为主按钮并标「首次必做」
+        """
         try:
             import adapter
             ts = adapter.list_targets()
         except Exception:
-            return
+            ts = []
         n = len(ts)
         if hasattr(self, "lbl_targets"):
             self.lbl_targets.configure(
                 text=f"已装 {n} 份适配载荷" if n else "还没有适配载荷",
                 fg=OK_C if n else FG_DIM)
+
+        bundled = os.path.isfile(resource_path("assets", "payload", "preload.so"))
+        self._apply_payload_state("bundled" if bundled else
+                                  ("targets_only" if n else "none"), n)
+
+    def _apply_payload_state(self, state, n=0):
+        """按载荷状态调按钮主次 + 状态栏提示。三种状态见 refresh_targets 的注释。"""
+        if not hasattr(self, "btn_one") or not hasattr(self, "btn_adapter"):
+            return
+        self._payload_state = state
+
+        if state == "none":
+            # 没有任何载荷：向导才是真正的第一步。主按钮换成向导，
+            # 一键全自动降成普通样式 —— 不 disable，用户仍可自己硬闯
+            self.btn_adapter.configure(
+                text="① 内核适配向导（首次必做）", width=24,
+                bg=ACCENT, fg="#ffffff",
+                activebackground=ACCENT_H, activeforeground="#ffffff")
+            self.btn_one.configure(
+                text="一键全自动", bg=BG3, fg=FG_DIM,
+                activebackground=BG3, activeforeground=FG_DIM)
+            self.set_status("本包未内置载荷 —— 先点左侧「内核适配向导」现编，"
+                            "编完再点一键全自动", WARN_C)
+        else:
+            self.btn_adapter.configure(
+                text="内核适配向导", width=14,
+                bg=BG3, fg=FG,
+                activebackground=BG3, activeforeground=FG)
+            self.btn_one.configure(
+                text="一键全自动", bg=ACCENT, fg="#ffffff",
+                activebackground=ACCENT_H, activeforeground="#ffffff")
+            if state == "targets_only":
+                self.set_status(f"载荷来自适配目录（{n} 份），可直接一键全自动", OK_C)
+            # bundled 不动状态栏：那句「已就绪」是启动流程写的，别盖掉
 
     def _make_worker(self, **kw):
         serial = self._selected_serial()
@@ -1862,8 +2089,16 @@ class App:
         # 免得将来新加一条路径忘了带 force_model 又被闸门挡住
         kw.setdefault("force_model", bool(getattr(self, "var_force", None)
                                           and self.var_force.get()))
+        # 同上：强制重跑也在这里统一注入，且读一次就复位 —— 否则后面点任何一个
+        # 按钮都会莫名继承"无视已 root 状态"
+        kw.setdefault("force_rerun", self._take_force_rerun())
         w = RootWorker(self.adb, q=self.q, **kw)
         return w
+
+    def _take_force_rerun(self):
+        v = bool(getattr(self, "_force_rerun", False))
+        self._force_rerun = False
+        return v
 
     def start_detect(self):
         self._start_worker(do_detect=True, do_deploy=False, tries=1)
@@ -2059,6 +2294,9 @@ def main():
                     help="型号或内核与本工具适配的不一致时仍然继续。"
                          "默认会拦下来 —— 偏移绑死在 Leaf5 / 4.2.3-rel_0928 / 4.19.157，"
                          "别的机器上跑错偏移是 kernel panic")
+    ap.add_argument("--force-rerun", action="store_true",
+                    help="设备上已经有 su 时也照样重跑一遍 exploit。"
+                         "默认会跳过（已有 root 再 patch 一遍内核没有收益）")
     ap.add_argument("--port", type=int, default=DEFAULT_PORT, help=f"adb server 端口，默认 {DEFAULT_PORT}")
     # 用 known 版：`--edl dump -o 某个目录` 里 -o 属于 edl 子命令，
     # 主 parser 不认识它。用 parse_args 会直接 rc=2 拒掉，看起来像

@@ -71,6 +71,44 @@ ONYX BOOX Leaf5 的一键 root 客户端。内嵌 adb，不依赖机器上装没
 前两步偏移错了是 kernel panic，第三步错了是写坏 boot，第四步错了是开不了机。
 都不是"再点一次就好"的量级。
 
+### 设备已经 root 过：也会先停下
+
+`1.1.3` 起，点一键之前先查一次设备上有没有能用的 `su`（`roottool.py:687`
+`precheck_root()`）。有就不推载荷、不跑 exploit，把结论当**绿色提示**给出
+（不是红色失败 —— 一个字节都没写设备）。
+
+```
+  设备已经是 Magisk root（31.1:MAGISK:R，/debug_ramdisk/su），重启后依然有效，
+  没有必要再跑一遍。
+```
+
+拦不拦看**两件事**：root 是哪种来路，以及你勾了什么。
+
+| 设备上的 root | 勾选 | 行为 |
+|---|---|---|
+| Magisk（`/debug_ramdisk/su`），重启仍在 | 什么都没勾 | **停**，提示已经是 root |
+| Magisk | 勾「安装 Magisk」 | **停** —— 会拿已 patch 的 boot 再 patch 一次，叠补丁有写坏风险 |
+| Magisk | 只勾「安装 AMS 模块」 | 放行，**跳过 exploit**，直接装模块 |
+| exploit 临时 root（`DEV_SU`），重启就没了 | 什么都没勾 | **停**，并说明要持久化就勾 Magisk |
+| exploit 临时 root | 勾「安装 Magisk」 | 放行，**跳过 exploit**，用现有 su 直接装 |
+| 任意 | 显式「强制重跑」 | 全放行，日志打 `[!] 已要求强制重跑` |
+
+两条来路区别对待的原因：`/debug_ramdisk/su` 是 Magisk 给的，重启后还在，再跑一遍
+纯属多余；`DEV_SU` 是 exploit 自建的，只对本次开机有效 —— 这时跳过 exploit、
+接着装 Magisk 是有意义的一步，不是重复劳动。
+
+为什么值得单独拦一道：exploit 干的是 patch 内核结构体（`rt_mutex_waiter` 那套），
+拿到的是**同一种 root**。已经有 root 再 patch 一遍没有任何收益，代价是两轮内核态
+竞态，其中一轮挂住就是 `device offline`。
+
+要跳过（换 Magisk 版本、重打 boot、自己排查问题）：
+
+- 界面：提示框上点「是」，只对这一轮有效，下一轮自动复位
+- 命令行：`Leaf5RootTool.exe --auto --force-rerun`
+
+换 Magisk 版本或重打 boot，用 Magisk App 里的「安装 → 直接安装」更稳 —— 它清楚
+自己上次写了什么，本工具不知道。
+
 ---
 
 ## 能 root 哪些设备
