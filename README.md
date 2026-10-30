@@ -136,11 +136,58 @@ adb shell su -c "cp /system/framework/services.jar /data/local/tmp/s.jar"
 
 第 1 步过不了就别往下 —— 那是偏移或 sepolicy 的问题，硬上 Magisk 只会把 boot 写坏。
 
-### 别指望闸门替你判断
+### 闸门能拦什么，拦不住什么
 
-闸门判据是 `TARGET_MODEL not in model and "TabBoox" not in model`
-（`roottool.py:570`）。Leaf5 自己的 `ro.product.model` 就是 `TabBoox`，ONYX 也有别的
-机型报这个值 —— **这些机器不会被拦**，工具照常往下推载荷。还是先跑 `--check` 自己确认。
+判据是 `TARGET_MODEL not in model and "TabBoox" not in model`（`roottool.py:570`）。
+实测这台 Leaf5 报 `ro.product.model=Leaf5`，正常过闸；`TabBoox` 出现在的是
+`ro.build.fingerprint`（`ONYX/TabBoox/TabBoox:13/...`）里，不是 model 字段。
+
+后半个 `"TabBoox"` 条件是留给 model 真报 TabBoox 的机器的。ONYX 有几代产品共用
+这个 platform 名，如果哪台的 `ro.product.model` 也返回它，就会被当成同类放行 ——
+**这种机器闸门不拦**。型号名字对、内核不对的更危险：它照样往下推载荷。
+
+所以别把闸门当授权书。先跑 `--check`，自己看 model 和 `uname -r` 两个值。
+
+### 原厂固件包：地址、解密、提 boot
+
+`boot_b.img` 是 Magisk patch 过的，不能当原厂基底。原厂镜像在官方 `update.upx` 里，
+设备上「系统更新」点的就是这个接口：
+
+```bash
+python tools/fwq.py Leaf5
+#   版本      2026-09-28_15-24_4.2.3-rel_0928_656b72278
+#   构建号    9015   release
+#   大小      1,867,290,835 字节  (1.74 GiB)
+#   md5       af649ee4fc6c0ccbb18a07610419db77
+#   直链[0]   http://firmware.boox.com/af649ee4fc6c0ccbb18a07610419db77/update.upx
+```
+
+接口是 `http://data.boox.com/api/1/firmware/update?where={...}`，字段
+`buildNumber / buildType / deviceMAC / lang / model / submodel / fingerprint`。
+`model` 填设备 `ro.product.model` 那个串（这台是 `Leaf5`）。`buildNumber=0`
+要的是最新**全量**包；报上当前版本号可能只回增量包。
+
+下载下来是加密的，用 [Hagb/decryptBooxUpdateUpx](https://github.com/Hagb/decryptBooxUpdateUpx) 解：
+
+```bash
+pip install pycryptodome
+python DeBooxUpx.py Leaf5 update.upx update.zip
+```
+
+Leaf5 的 Key/IV 已经在它的 `BooxKeys.csv` 里（`648C3243…` / `DFA378E2…`），
+不用自己抓。算法是 AES-128-CFB，整文件流式解，解出来头 4 字节就是 `PK\x03\x04`。
+
+```bash
+unzip -o update.zip payload.bin payload_properties.txt
+payload-dumper-go -p boot payload.bin     # 或 cyxx/extract_android_ota_payload
+```
+
+注意：`payload.bin` 里是 `boot` 分区本体，A/B 机器刷回时按当前槽写
+（`boot_a` 或 `boot_b`），别两个槽都写。
+
+实测到哪一步：接口返回与 upx 解密这两步在本机跑过 —— 拉前 4 KB 用 Leaf5 的
+Key/IV 解，头是 `PK\x03\x04`、第一个 entry 是 `META-INF/com/android/`。
+`payload.bin` 提取那步没跑（1.74 GiB 全量没下），命令按工具用法写的。
 
 ---
 
