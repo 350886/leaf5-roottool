@@ -3,11 +3,16 @@
 """
 打包 Leaf5RootTool.exe
 
-  python build.py            单文件（默认）
+  python build.py            出两个版本（默认）：普通版 + 带 Google Play 版
+  python build.py --no-gp    只出普通版
+  python build.py --gp       只出带 Google Play 版
   python build.py --onedir   目录版，启动快，便于排障
   python build.py --sign     打包后签名
+  python build.py --apk X.apk  指定要打进带版里的商店包
 
-产物：dist/Leaf5RootTool.exe
+产物：
+  dist/Leaf5RootTool.exe        不带商店 APK（37 MB），靠外部 apk 目录
+  dist/Leaf5RootTool_gplay.exe  内置商店 APK（约 100 MB），换机器不用带文件夹
 """
 
 import os
@@ -17,6 +22,9 @@ import subprocess
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 NAME = "Leaf5RootTool"
+# 带 Google Play 的版本单独一个名字 —— 两个 EXE 要能并排放，
+# 用户一眼看出哪个不用带 apk 文件夹
+GP_NAME = "Leaf5RootTool_gplay"
 VERSION = (1, 1, 3, 0)
 
 ADB = ["adb.exe", "AdbWinApi.dll", "AdbWinUsbApi.dll"]
@@ -79,8 +87,9 @@ def sync_exploit():
     return SRC_DST
 
 
-def ver_file():
+def ver_file(name=None):
     """PyInstaller 的版本资源，让 EXE 属性页有东西可看"""
+    name = name or NAME
     path = os.path.join(HERE, "build", "version_info.txt")
     os.makedirs(os.path.dirname(path), exist_ok=True)
     # FixedFileInfo 要的是元组，StringFileInfo 要的是 "a.b.c.d"
@@ -96,8 +105,8 @@ def ver_file():
             "      StringStruct('CompanyName', 'local'),\n"
             "      StringStruct('FileDescription', 'Leaf5 Root Tool'),\n"
             "      StringStruct('FileVersion', '" + txt + "'),\n"
-            "      StringStruct('InternalName', 'Leaf5RootTool'),\n"
-            "      StringStruct('OriginalFilename', 'Leaf5RootTool.exe'),\n"
+            "      StringStruct('InternalName', '" + name + "'),\n"
+            "      StringStruct('OriginalFilename', '" + name + ".exe'),\n"
             "      StringStruct('ProductName', 'Leaf5 Root Tool'),\n"
             "      StringStruct('ProductVersion', '" + txt + "')])]),\n"
             "    VarFileInfo([VarStruct('Translation', [2052, 1200])])\n"
@@ -105,6 +114,23 @@ def ver_file():
             ")\n"
         )
     return path
+
+
+def gp_apk_from_dir():
+    """
+    assets/apk/ 下体积最大的那个 .apk。
+
+    选最大是为了排除 split APK 的分片（那几片都只有几 MB，
+    装上去会缺资源）。目录里只放一个包时这一步等于没做。
+    """
+    d = os.path.join(HERE, "assets", "apk")
+    if not os.path.isdir(d):
+        return None
+    cands = [os.path.join(d, n) for n in os.listdir(d)
+             if n.lower().endswith(".apk")]
+    if not cands:
+        return None
+    return max(cands, key=os.path.getsize)
 
 
 def main():
@@ -172,15 +198,52 @@ def main():
             print("    preload.so 是编译产物，不在拉取清单里 —— 跑一次「内核适配向导」现编。")
         return 2
 
+    # -- 出哪几个版本 --------------------------------------------------------
+    only_no = "--no-gp" in sys.argv
+    only_gp = "--gp" in sys.argv
+    if only_no and only_gp:
+        print("[-] --gp 和 --no-gp 不能同时给")
+        return 5
+
+    apk_arg = None
+    for i, a in enumerate(sys.argv):
+        if a == "--apk" and i + 1 < len(sys.argv):
+            apk_arg = sys.argv[i + 1]
+        elif a.startswith("--apk="):
+            apk_arg = a.split("=", 1)[1]
+
+    need_gp = only_gp or not only_no
+    gp_apk = None
+    if need_gp:
+        if apk_arg:
+            if not os.path.isfile(apk_arg):
+                print(f"[-] 指定的 APK 不存在：{apk_arg}")
+                return 5
+            gp_apk = os.path.abspath(apk_arg)
+        else:
+            gp_apk = gp_apk_from_dir()
+        if not gp_apk:
+            print("[-] 带 Google Play 版要内置商店 APK，但 assets/apk/ 里没有：")
+            print("     ", os.path.join(HERE, "assets", "apk"))
+            print("     放一个 Phonesky / com.android.vending 的 .apk 进去，或用 --apk 指定")
+            print("     只要普通版：python build.py --no-gp")
+            return 5
+        print(f"[*] 内置 APK: {os.path.basename(gp_apk)}  "
+              f"{os.path.getsize(gp_apk) / 1048576:.1f} MB")
+
+    targets = []
+    if not only_gp:
+        targets.append((NAME, None))
+    if need_gp:
+        targets.append((GP_NAME, gp_apk))
+
     src_dir = sync_exploit()
 
-    args = [
+    base = [
         sys.executable, "-m", "PyInstaller",
         "--noconfirm", "--clean",
         "--onedir" if onedir else "--onefile",
         "--windowed",
-        "--name", NAME,
-        "--version-file", ver_file(),
         "--distpath", os.path.join(HERE, "dist"),
         "--workpath", os.path.join(HERE, "build", "work"),
         "--specpath", os.path.join(HERE, "build"),
@@ -188,62 +251,77 @@ def main():
 
     icon = os.path.join(HERE, "assets", "icon.ico")
     if os.path.isfile(icon):
-        args += ["--icon", icon]
+        base += ["--icon", icon]
 
     for n in ADB:
-        args += ["--add-binary", f"{os.path.join(HERE,'assets','adb',n)};assets/adb"]
+        base += ["--add-binary", f"{os.path.join(HERE,'assets','adb',n)};assets/adb"]
     for n in PAYLOAD:
-        args += ["--add-data", f"{os.path.join(HERE,'assets','payload',n)};assets/payload"]
+        base += ["--add-data", f"{os.path.join(HERE,'assets','payload',n)};assets/payload"]
     for n in MAGISK:
-        args += ["--add-data", f"{os.path.join(HERE,'assets','magisk',n)};assets/magisk"]
+        base += ["--add-data", f"{os.path.join(HERE,'assets','magisk',n)};assets/magisk"]
     # programmer 和 zadig 都是二进制，放 assets 根（edllink/drivers 按名字找）
     for n in LOADERS:
         p = os.path.join(HERE, "assets", n)
         if os.path.isfile(p):
-            args += ["--add-binary", f"{p};assets"]
+            base += ["--add-binary", f"{p};assets"]
     zp = os.path.join(HERE, "assets", ZADIG)
     if os.path.isfile(zp):
-        args += ["--add-binary", f"{zp};assets"]
+        base += ["--add-binary", f"{zp};assets"]
 
     # 适配向导用的源码树（现编 preload.so 需要）
-    args += ["--add-data", f"{src_dir};assets/exploit_src/exploit"]
+    base += ["--add-data", f"{src_dir};assets/exploit_src/exploit"]
     # edlclient 的子模块大量是条件导入，静态分析跟不全 —— 整包收
-    args += ["--collect-submodules", "edlclient"]
+    base += ["--collect-submodules", "edlclient"]
     # libusb-1.0.dll 跟着 libusb_package 走；不 collect 的话运行期
     # add_dll_directory 会落空，pyusb 报 "No backend available"
-    args += ["--collect-all", "libusb_package"]
+    base += ["--collect-all", "libusb_package"]
     for mod in ("adapter", "adapter_ui", "elfsyms", "ndkman", "fp",
-                "imageksym", "edlman", "a64", "autopilot",
+                "imageksym", "edlman", "a64", "autopilot", "gp",
                 "edlmain", "edlclient", "edllink", "drivers", "usbtrace",
                 "docopt", "usb", "serial", "capstone", "colorama"):
-        args += ["--hidden-import", mod]
+        base += ["--hidden-import", mod]
 
     # 砍掉没用到的大件，能省 8MB 左右
     for mod in ("numpy", "pandas", "matplotlib", "PIL", "PyQt5", "PySide6",
                 "scipy", "setuptools", "pip", "pydoc_data",
                 "notebook", "jupyter", "IPython"):
-        args += ["--exclude-module", mod]
+        base += ["--exclude-module", mod]
 
-    args.append(os.path.join(HERE, "roottool.py"))
+    rc_all = 0
+    built = []
+    for name, apk in targets:
+        args = list(base) + ["--name", name, "--version-file", ver_file(name)]
+        if apk:
+            # 打进 assets/apk/，运行时 gp.bundled_apk_dir() 从 _MEIPASS 下的同一路径读
+            args += ["--add-data", f"{apk};assets/apk"]
+        args.append(os.path.join(HERE, "roottool.py"))
 
-    print("[*] 打包中…")
-    r = subprocess.run(args, cwd=HERE)
-    if r.returncode != 0:
-        print("[-] PyInstaller 失败")
-        return r.returncode
+        print(f"\n[*] 打包 {name} …")
+        r = subprocess.run(args, cwd=HERE)
+        if r.returncode != 0:
+            print(f"[-] {name} 打包失败")
+            rc_all = r.returncode
+            continue
 
-    exe = os.path.join(HERE, "dist", NAME + ".exe")
-    if not os.path.isfile(exe):
-        print(f"[-] 没生成 {exe}")
-        return 3
-    size = os.path.getsize(exe) / 1048576
-    print(f"[+] {exe}  {size:.1f} MB")
+        exe = os.path.join(HERE, "dist", name + (".exe" if os.name == "nt" else ""))
+        if not onedir and not os.path.isfile(exe):
+            print(f"[-] 没生成 {exe}")
+            rc_all = 3
+            continue
+        size = os.path.getsize(exe) / 1048576 if os.path.isfile(exe) else 0
+        print(f"[+] {exe}  {size:.1f} MB"
+              + ("  （内置商店 APK）" if apk else "  （靠外部 apk 目录）"))
 
-    if do_sign:
-        rc = sign(exe)
-        if rc != 0:
-            print("[!] 签名失败，EXE 仍然可用（只是没有数字签名）")
-    return 0
+        if do_sign and os.path.isfile(exe):
+            if sign(exe) != 0:
+                print("[!] 签名失败，EXE 仍然可用（只是没有数字签名）")
+        built.append((exe, size))
+
+    if len(built) > 1:
+        print("\n[*] 两个版本：")
+        for exe, size in built:
+            print(f"    {os.path.basename(exe):28s} {size:6.1f} MB")
+    return rc_all
 
 
 def sign(exe):

@@ -13,6 +13,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import gp  # noqa: E402
 
+# 源码运行时 bundled_apk_dir() 指向仓库的 assets/apk —— 那里真有一份 64 MB 的包，
+# 会污染每个断言的候选列表。测试里把它指到空目录。
+gp.bundled_apk_dir = lambda: os.path.join(tempfile.gettempdir(), "__no_bundled_apk__")
+
 OK = 0
 BAD = []
 
@@ -169,18 +173,24 @@ r = new_gp(adb, base=d).enable(settle=0)
 ck(r["stage"] == "failed", "stage=failed", r)
 ck("VERSION_DOWNGRADE" in r["detail"], "detail 带原始失败原因", r["detail"])
 
-print("== 9. candidate_apks 取体积最大的 ==")
+print("== 9. candidate_apks：目录顺序即优先级，目录内取最大 ==")
 d = tempfile.mkdtemp()
 os.makedirs(os.path.join(d, "assets", "apk"))
 os.makedirs(os.path.join(d, "apk"))
-open(os.path.join(d, "assets", "apk", "Phonesky.apk"), "wb").write(b"x" * 1024)
+inner = os.path.join(d, "assets", "apk", "Phonesky.apk")
+open(inner, "wb").write(b"x" * 1024)
 big = os.path.join(d, "apk", "com.android.vending_42.apk")
 open(big, "wb").write(b"x" * 65536)
 open(os.path.join(d, "apk", "readme.txt"), "wb").write(b"x" * 999999)
+open(os.path.join(d, "apk", "vending_split_config.arm64.apk"), "wb").write(b"x" * 512)
 got = gp.candidate_apks(base_dir=d)
 ck(len(got) == 2, f"筛掉非 apk，剩 {len(got)} 个", got)
+ck(got[0] == inner, "assets/apk 优先于 apk", got)
+ck(got[1] == big, "apk 目录里取体积最大的（跳过 split 分片）", got)
 g = new_gp(FakeAdb(), base=d)
-ck(g.find_apk() == big, "取体积最大的那个", g.find_apk())
+ck(g.find_apk() == inner, "find_apk 返回优先级最高的那个", g.find_apk())
+os.remove(inner)
+ck(new_gp(FakeAdb(), base=d).find_apk() == big, "删掉首选后落到下一个目录")
 try:
     gp.candidate_apks(base_dir=d, explicit="/no/such.apk")
     ck(False, "显式指定的 APK 不存在时应抛 GpError")

@@ -71,18 +71,35 @@ def _looks_like_store(name):
     return ("vending" in n or "phonesky" in n) and n.endswith(".apk")
 
 
+def bundled_apk_dir():
+    """
+    打进 EXE 的那一份所在目录。
+
+    onefile 模式下 sys._MEIPASS 是每次启动新解出来的临时目录，
+    里面的文件可以直接交给 adb install（是真实路径），但启动后就没了 ——
+    所以这里只读，不往这儿写任何东西。
+    """
+    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base, "assets", "apk")
+
+
 def candidate_apks(base_dir=None, explicit=None):
     """
-    按优先级列出候选 APK 路径（存在且像商店包）。只扫固定几处，不做全盘 find。
+    按优先级列出候选 APK，**目录顺序即优先级**，每个目录里只出体积最大的那一个。
 
-    参数都在外面：base_dir 是工具根目录（EXE 所在或脚本所在），
-    explicit 是用户/UI 直接指定的文件。
+    为什么每个目录只出一个：split APK 那几片都只有几 MB，取最大的才对；
+    但跨目录不能全局按体积排 —— 用户自己换的新版可能比内置那份小，
+    全局排序会把它挤掉。所以先在目录内选最大，再按目录顺序排队。
+
+    顺序：
+        显式 --apk > <base>/assets/apk > <base>/apk > <cwd>/apk
+        > <EXE 同级>/apk > 打进 EXE 里的那一份（兜底）
     """
     out = []
     if explicit:
         if not os.path.isfile(explicit):
             raise GpError(f"指定的 APK 不存在：{explicit}")
-        out.append(explicit)
+        out.append(os.path.abspath(explicit))
 
     dirs = []
     if base_dir:
@@ -91,21 +108,30 @@ def candidate_apks(base_dir=None, explicit=None):
     dirs.append(os.path.join(os.getcwd(), "apk"))
     if getattr(sys, "frozen", False):
         dirs.append(os.path.join(os.path.dirname(sys.executable), "apk"))
+    dirs.append(bundled_apk_dir())
 
-    seen = set(os.path.abspath(p) for p in out)
+    seen = set(out)
     for d in dirs:
         try:
             names = os.listdir(d)
         except OSError:
             continue
+        best, best_size = None, -1
         for n in names:
             if not _looks_like_store(n):
                 continue
             p = os.path.abspath(os.path.join(d, n))
             if p in seen:
                 continue
-            seen.add(p)
-            out.append(p)
+            try:
+                size = os.path.getsize(p)
+            except OSError:
+                continue
+            if size > best_size:
+                best, best_size = p, size
+        if best:
+            seen.add(best)
+            out.append(best)
     return out
 
 
@@ -173,18 +199,19 @@ class Gp:
     # -- 安装 ---------------------------------------------------------------
 
     def find_apk(self, explicit=None):
-        """三级回落找商店 APK；找不到抛 GpError，带上找过的目录，方便用户自己放对位置。"""
+        """按优先级找商店 APK；找不到抛 GpError，带上找过的目录，方便用户自己放对位置。"""
         if self._apk and not explicit and os.path.isfile(self._apk):
             return self._apk
         cands = candidate_apks(self.base_dir, explicit)
         if not cands:
             where = [os.path.join(self.base_dir or ".", "apk"),
                      os.path.join(os.getcwd(), "apk")]
-            raise GpError("没找到商店 APK，放到这些目录之一：\n  "
-                          + "\n  ".join(where)
-                          + "\n文件名含 vending 或 Phonesky，扩展名 .apk")
-        # 体积最大的才是完整包；split APK 那几片都只有几 MB
-        cands.sort(key=lambda p: os.path.getsize(p), reverse=True)
+            raise GpError(
+                "没找到商店 APK，放到这些目录之一：\n  "
+                + "\n  ".join(where)
+                + "\n文件名含 vending 或 Phonesky，扩展名 .apk"
+                + "\n（带 _gp 后缀的那个 EXE 内置了一份，不找包也能装：换它）")
+        # 目录顺序即优先级，每个目录里已经在 candidate_apks 内选过最大的那个
         self._apk = cands[0]
         self._log(f"APK: {self._apk} ({os.path.getsize(self._apk):,} 字节)")
         return self._apk

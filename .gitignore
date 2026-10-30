@@ -22,6 +22,10 @@ assets/magisk/*
 assets/zadig.exe
 assets/*.bin
 assets/payload/preload.so
+# 商店 APK 64 MB，同一个道理不进仓库。build.py 找不到会直接报路径；
+# 只出普通版不受影响（--no-gp）。
+assets/apk/*
+!assets/apk/.gitkeep
 
 # ── 备份 / 中间产物 ─────────────────────────────────────────────────
 _bak_*/

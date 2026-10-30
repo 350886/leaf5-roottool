@@ -312,23 +312,50 @@ launch_store()      am start -W + 等 3 秒 + 读 topResumedActivity，两个判
 手上有 42.x 的包就直接覆盖换上，比让人去猜"为什么有账号还是 blocked"省事。
 没开这个开关就只探测不动设备。
 
-### APK 放哪
+### 两个版本：带包的和不带包的
 
-商店包 64 MB，**不打进 EXE**（会把 37 MB 撑到 100 MB）。工具按这个顺序找，取体积最大的那个：
+打包时**同时出两个 EXE**，并排放着，按场景挑：
+
+| 文件 | 体积 | 商店 APK | 什么时候用 |
+|---|---|---|---|
+| `Leaf5RootTool.exe` | 37 MB | 不带，靠外面 `apk\` 目录 | 自己机器上用，或者不想让 EXE 变胖 |
+| `Leaf5RootTool_gplay.exe` | 约 101 MB | **内置**，启动时解到临时目录 | 发给别人 / 换机器，单文件就能装商店 |
+
+两个版本功能完全一样，区别只有"APK 从哪来"。带版多出来的 64 MB 就是那个 APK 本身
+（APK 已经是 zip，再压没有意义，所以体积是实打实加上的）。
+
+```bash
+python build.py              # 两个都出
+python build.py --no-gp      # 只出 37 MB 那个
+python build.py --gp         # 只出带包的
+python build.py --apk X.apk  # 指定打进带版里的包
+```
+
+打包前把商店 APK 放进 `assets/apk/`（这个目录不进仓库，`.`gitkeep` 留着）。
+`--no-gp` 不需要这个目录。
+
+### APK 放哪（不带包的那个版本）
+
+按这个顺序找，**目录顺序就是优先级**，每个目录里只取体积最大的那一个：
 
 ```
 --apk 显式指定
 <EXE 同级>/assets/apk/
 <EXE 同级>/apk/
 <cwd>/apk/
+<EXE 同级>/apk
+打进 EXE 里的那一份          ← 只有 _gplay 版才有，兜底
 ```
 
 文件名含 `vending` 或 `Phonesky`、扩展名 `.apk` 就会被认出来。
 一次找不到会直接把该放哪几个目录打在报错里，不用猜。
 
-打包好的 `dist\apk\` 里已经放了一份 `Phonesky_42.0.18-31.apk`。
-**把 EXE 挪到别的机器用时，`apk` 文件夹要一起拷过去** —— 只拷 EXE 的话，
-商店没装的设备会停在"没找到商店 APK"这一步。
+**为什么每个目录只取最大的一个**：split APK 那几片都只有几 MB，取最大才对。
+但跨目录不能全局按体积排 —— 你自己换的新版可能比内置那份小，全局排序会把它挤掉，
+所以是"先目录内选最大，再按目录顺序排队"。
+
+**`dist\apk\` 里已经放了一份 `Phonesky_42.0.18-31.apk`。** 用不带包的版本
+换机器时，`apk` 文件夹要跟 EXE 一起拷过去。
 
 版本选 **Google Play Store 42.x / 44.x，SDK 31+，arm64-v8a，nodpi**。
 44.6.15 在 Leaf5 上装得上但一开就退；42.0.18-31 实测能用。
@@ -909,7 +936,8 @@ a64.py                  极简 ARM64 解码器（只为推 TASK_CRED_OFF / PRCTL
 elfsyms.py              纯标准库 ELF64 符号表解析 + kallsyms 文本解析
 ndkman.py               NDK 查找 / 下载 / 解压 / 校验 / 裁剪
 drivers.py              Zadig 驱动引导（新机器缺 WinUSB 时）
-build.py                打包脚本
+gp.py                   Google Play 的探测 / 安装 / 启用（独立模块，不依赖 RootWorker）
+build.py                打包脚本（同时出带包和不带包两个版本）
 
 edlmain.py              firehose 协议层（USB / 串口 / 网络三种后端）
 edllink.py              9008 会话封装（programmer 选择、4MB 分块读、校验重读）
@@ -920,7 +948,7 @@ edlclient/              vendored 的 bkerler/edl（去了 .git，只留 Library/
 assets/                 运行时资源
   exploit_src/          exploit 源码树，适配向导现编 preload.so 用（在仓库里）
   payload/device_root.sh 设备端自持脚本（在仓库里）
-  adb/ magisk/ *.bin zadig.exe payload/preload.so   ← 自己按下面的表放
+  adb/ magisk/ apk/ *.bin zadig.exe payload/preload.so   ← 自己按下面的表放
 
 build/                  PyInstaller 的 spec 与版本资源
 _test_dump/             guard 闸门与 GUI 的离线自测（不接设备也能跑）
@@ -935,13 +963,17 @@ _test_dump/             guard 闸门与 GUI 的离线自测（不接设备也能
 
 ```bash
 python tools/fetch_deps.py   # 拉齐 assets 下缺的二进制（带 sha256 校验）
-python build.py              # 单文件，产物 dist/Leaf5RootTool.exe
-python build.py --sign       # 打包后签名
+python build.py              # 两个版本：dist/Leaf5RootTool.exe + dist/Leaf5RootTool_gplay.exe
+python build.py --sign       # 打包后签名（两个都签）
+python build.py --no-gp      # 只要 37 MB 那个
+python build.py --gp         # 只要带内置 APK 那个
 python build.py --onedir     # 目录版，启动快
 ```
 
 `build.py` 缺文件时会直接报路径，并区分「能自动下的」和「只能自己产的」
 —— 前者一条 `fetch_deps.py` 解决，后者是 `preload.so`。
+出带包版本还要求 `assets/apk/` 里有商店 APK，没有会直接停下让你放，
+不会打出一个"看着正常但装不了商店"的包。
 
 必须用带 tkinter 的 64 位 Python（微软商店那个精简版没有，PyInstaller
 不会报错，会安安静静打出一个启动就崩的包）。

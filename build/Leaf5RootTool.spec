@@ -4,7 +4,7 @@ from PyInstaller.utils.hooks import collect_all
 
 datas = [('E:\\BOOX\\root-tool\\assets\\payload\\preload.so', 'assets/payload'), ('E:\\BOOX\\root-tool\\assets\\payload\\device_root.sh', 'assets/payload'), ('E:\\BOOX\\root-tool\\assets\\magisk\\Magisk-v31.1.apk', 'assets/magisk'), ('E:\\BOOX\\root-tool\\assets\\exploit_src\\exploit', 'assets/exploit_src/exploit')]
 binaries = [('E:\\BOOX\\root-tool\\assets\\adb\\adb.exe', 'assets/adb'), ('E:\\BOOX\\root-tool\\assets\\adb\\AdbWinApi.dll', 'assets/adb'), ('E:\\BOOX\\root-tool\\assets\\adb\\AdbWinUsbApi.dll', 'assets/adb'), ('E:\\BOOX\\root-tool\\assets\\lito_op_n10_fhprg.bin', 'assets'), ('E:\\BOOX\\root-tool\\assets\\lito_moto_fhprg.bin', 'assets'), ('E:\\BOOX\\root-tool\\assets\\zadig.exe', 'assets')]
-hiddenimports = ['adapter', 'adapter_ui', 'elfsyms', 'ndkman', 'fp', 'imageksym', 'edlman', 'a64', 'autopilot', 'edlmain', 'edlclient', 'edllink', 'drivers', 'usbtrace', 'docopt', 'usb', 'serial', 'capstone', 'colorama']
+hiddenimports = ['adapter', 'adapter_ui', 'elfsyms', 'ndkman', 'fp', 'imageksym', 'edlman', 'a64', 'autopilot', 'gp', 'edlmain', 'edlclient', 'edllink', 'drivers', 'usbtrace', 'docopt', 'usb', 'serial', 'capstone', 'colorama']
 hiddenimports += collect_submodules('edlclient')
 tmp_ret = collect_all('libusb_package')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
