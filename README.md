@@ -229,6 +229,112 @@ Key/IV 解，头是 `PK\x03\x04`、第一个 entry 是 `META-INF/com/android/`�
 
 ---
 
+## Google Play（和 root 无关的一条腿）
+
+界面上第四个按钮「装 Google Play」，命令行 `--gplay`。**不需要先 root**，
+root 过的机器也不需要再走一遍。这条腿不进 root 流程，`precheck_root()` 也管不着它。
+
+### 固件里其实带了 GMS，别去下三件套
+
+把 4.2.3 那个包的三个分区全列过一遍：
+
+| 分区 | 路径 | |
+|---|---|---|
+| `product` | `priv-app/GmsCore/GmsCore.apk` 147,488,796 字节 | GMS 本体在 |
+| `system_ext` | `priv-app/GoogleServicesFramework/` | GSF 在 |
+| `product` | `GoogleRestore` / `ConfigUpdater` / `OneTimeInitializer` | 配套在 |
+| `product` | `overlay/GmsConfigOverlayCommon` / `GmsConfigOverlayGSA` | 资源在 |
+| `system` | `app/GoogleExtShared` | 共享库在 |
+| 全部三个 | `Phonesky` / `com.android.vending` | **一个都没有** |
+
+所以缺的只有 Play 商店这一个 APK。装三件套会**覆盖**掉预置的 GmsCore ——
+签名不一样还会装失败，装成功了更麻烦（预置的那份被顶掉，GSF ID 全变）。别装。
+
+### 闪退不是缺组件，是框架层拦
+
+`framework.jar` 里 ONYX 自己加的一段：
+
+```java
+// android.onyx.optimization.Constant
+DISABLED_PACKAGES = { "com.android.vending" }
+
+// android.onyx.utils.ActivityManagerHelper
+static boolean gmsEnabled() { return OnyxMMKVConfigHelper.getBool("gms_enable", false); }
+
+// com.android.server.wm.ActivityStarter.executeRequest()
+if (!gmsEnabled() && isDisallow(pkg) && !isSystemApp(pkg))
+    throw new SecurityException(
+        "This app is not allowed to start because Google Play is disabled.");
+```
+
+黑名单里只有商店一个包，判据是 MMKV 里的 `gms_enable`，默认 `false`。
+**商店装成用户应用 → 不在 system → 被拦 → 一开就退回桌面。** 这就是"闪退"。
+
+### 正确的开法只有一条：登录 Google 账号
+
+`gms_enable` 由 ONYX 自己在**账号验证通过的那一刻**写入 —— 设置里那个
+「启用 Google Play」开关，在 4.x 里就是这套流程的壳。走完：
+
+```
+设置 -> 账号 -> 添加账号 -> Google -> 登录 -> 完成验证
+-> OTA 服务后台注册设备 -> 关机再开 -> 商店能开了
+```
+
+**工具不写这个值**，理由三条：
+
+- MMKV 是 mmap 二进制（有文件锁 + CRC），外部改要先停 ONYX 进程，改坏就是配置全丢；
+- ONYX 一升级换 key 名或换存储实现，写死的偏移立刻失效；
+- 这个值的语义是"本机已验证过 Google 账号"，硬写进去等于伪造验证状态，
+  Play 服务那边照样认为设备没认证。
+
+工具做的是**把用户送到那个页面**：连不上就 `am start` 拉起
+`android.settings.ADD_ACCOUNT_SETTINGS`（限定 `account_types=com.google`，失败退到不限类型，
+再退到设置首页），用户在设备上登录完，ONYX 自己把开关写进去。
+
+### 四个动作
+
+```
+probe()             pm list packages / dumpsys package / dumpsys account / 前台 Activity
+install(apk)        adb install -r -d（带 -d，从 44.x 退到 42.x 才不会被版本降级拦住）
+open_account_page() 三档回落拉起添加账号页
+launch_store()      am start -W + 等 3 秒 + 读 topResumedActivity，两个判据都看
+```
+
+`launch_store()` 的两个判据缺一不可：`SecurityException` 抛在 system_server 侧，
+不一定出现在 `am` 的输出里；而只看前台 Activity 又会把"起来了但立刻闪退"判成成功。
+**两个都不对才算失败。**
+
+`enable()` 把这些串成一条，返回固定字段的 dict（`ok` / `stage` / `detail` / `need_manual`），
+`stage` 一共五种：`installed` / `launched` / `need_login` / `blocked` / `failed`。
+
+### APK 放哪
+
+商店包 64 MB，**不打进 EXE**（会把 37 MB 撑到 100 MB）。工具按这个顺序找，取体积最大的那个：
+
+```
+--apk 显式指定
+<EXE 同级>/assets/apk/
+<EXE 同级>/apk/
+<cwd>/apk/
+```
+
+文件名含 `vending` 或 `Phonesky`、扩展名 `.apk` 就会被认出来。
+一次找不到会直接把该放哪几个目录打在报错里，不用猜。
+
+版本选 **Google Play Store 42.x / 44.x，SDK 31+，arm64-v8a，nodpi**。
+44.6.15 在 Leaf5 上装得上但一开就退；42.0.18-31 实测能用。
+
+### 现成的这条路走不通时
+
+- **商店能开，但装应用提示「设备未通过 Play 保护认证」** —— 拿 GSF ID 去
+  `google.com/android/uncertified` 登记，几分钟到几小时生效。
+- **`stage=blocked` 且 detail 里已经有账号** —— 账号在但开关没写进去。
+  去设置里把那个 Google 账号删掉重登一次，让验证流程重跑一遍。
+- **`stage=failed` 且提示 GMS 不在系统里** —— 这台固件把 GMS 裁了，
+  装 APK 解决不了，得换带 GMS 的固件。工具管不了这一种。
+
+---
+
 ## 一键全自动做了什么
 
 主按钮一条命令跑完全程。它不是"把七个按钮串起来"，是**每一步都用设备自己的

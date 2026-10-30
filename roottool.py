@@ -28,6 +28,13 @@ import argparse
 import subprocess
 import threading
 
+# Google Play 模块单独一个文件，不参与 root 流程。
+# 它的 adb 由 App 注入（同一个 Adb 实例），所以不需要自己找 adb.exe。
+try:
+    import gp as gplay
+except ImportError:
+    gplay = None
+
 # tkinter 只在 GUI 模式需要；CLI 模式（--check / --root）在没有 tk 的环境也能跑
 try:
     import tkinter as tk
@@ -1536,6 +1543,27 @@ def cli_main(args):
             elif kind == "done":
                 return
 
+    if args.gplay:
+        if gplay is None:
+            emit("[-] 缺少 gp.py，装商店功能不可用")
+            return 2
+        base = (os.path.dirname(sys.executable) if getattr(sys, "frozen", False)
+                else os.path.dirname(os.path.abspath(__file__)))
+        g = gplay.Gp(adb, base_dir=base, log=lambda s: emit("  " + s))
+        try:
+            r = g.enable(apk=args.apk)
+        except gplay.GpError as e:
+            emit(f"[-] {e}")
+            return 3
+        st = r.get("state")
+        if st is not None:
+            emit("[i] 商店 " + (f"已装 {st.store_version}" if st.store_installed else "未装")
+                 + " / GMS " + ("在" if st.gms_installed else "缺")
+                 + f" / 账号 {len(st.accounts)} 个"
+                 + " / 前台 " + (st.top or "未知"))
+        emit(f"[=] {r['stage']}: {r['detail']}")
+        return 0 if r.get("ok") else 1
+
     if args.check:
         w = RootWorker(adb, tries=1, q=q, do_deploy=False, do_detect=True)
 
@@ -1613,7 +1641,7 @@ class App:
         self.devices = []
 
         root.title(f"{APP_NAME} v{APP_VER}")
-        root.geometry("900x690")
+        root.geometry("900x720")
         root.minsize(780, 580)
         root.configure(bg=BG)
 
@@ -1749,6 +1777,18 @@ class App:
             activeforeground=WARN_C, font=("Microsoft YaHei UI", 9),
             highlightthickness=0, bd=0).pack(side="right")
 
+        # 第四行：Google Play。和 root 完全独立的一条腿 ——
+        # 装商店不需要先 root，root 过的机器也不需要再走一遍。
+        opt4 = tk.Frame(act, bg=BG2)
+        opt4.pack(fill="x", padx=10, pady=(0, 10))
+        tk.Label(opt4, text="谷歌服务？", bg=BG2, fg=FG_DIM,
+                 font=("Microsoft YaHei UI", 9)).pack(side="left")
+        self.btn_gplay = self._btn(opt4, "装 Google Play", self.start_gplay, w=14)
+        self.btn_gplay.pack(side="left", padx=6)
+        self.lbl_gplay = tk.Label(opt4, text="", bg=BG2, fg=FG_DIM,
+                                  font=("Microsoft YaHei UI", 8))
+        self.lbl_gplay.pack(side="left", padx=6)
+
         # 进度条。日志区是 expand=True 的，不给进度条固定高度就会被挤成一条线
         pf = tk.Frame(self.root, bg=BG, height=12)
         pf.pack(fill="x", padx=12, pady=(6, 2))
@@ -1828,6 +1868,8 @@ class App:
                     self.pb["value"] = rest[0] * 100
                 elif kind == "done":
                     self._on_done(bool(rest[0]), rest[1] if len(rest) > 1 else {})
+                elif kind == "gplay":
+                    self._on_gplay(rest[0])
         except queue.Empty:
             pass
         self.root.after(120, self._poll)
@@ -1888,7 +1930,8 @@ class App:
 
     def _busy(self, b):
         state = "disabled" if b else "normal"
-        for w in (self.btn_one, self.btn_detect, self.btn_deploy, self.btn_root):
+        for w in (self.btn_one, self.btn_detect, self.btn_deploy, self.btn_root,
+                  getattr(self, "btn_gplay", self.btn_root)):
             w.configure(state=state)
         for w in (self.chk_magisk, self.chk_module):
             w.configure(state=state)
@@ -2114,6 +2157,92 @@ class App:
         self._start_worker(do_detect=True, do_deploy=True, tries=n,
                            require_sysadmin=self.var_sysadmin.get())
 
+    # -- Google Play ---------------------------------------------------------
+
+    def _gp_base(self):
+        """
+        APK 的查找根。onefile 模式下 sys._MEIPASS 是临时解包目录，
+        用户往那儿放东西下次就没了，所以用 EXE 所在目录。
+        """
+        if getattr(sys, "frozen", False):
+            return os.path.dirname(sys.executable)
+        return os.path.dirname(os.path.abspath(__file__))
+
+    def start_gplay(self):
+        """
+        装商店 / 启用商店。不碰 root，也不写 gms_enable（见 gp.py 顶部说明）。
+
+        整个动作分两段：能一条命令跑完的（装、拉起）现在做；
+        需要人去设备上登录的（ONYX 的开关只在账号验证通过时写），
+        把页面拉起来就交回给用户。
+        """
+        if gplay is None:
+            self.log("[错误] 缺少 gp.py，装商店功能不可用", "bad")
+            return
+        if not self.adb:
+            self.log("[错误] adb 还没初始化", "bad")
+            return
+        if not self._selected_serial():
+            self.refresh_devices()
+        if not self._selected_serial():
+            self.log("[错误] 没有可用设备，无法开始", "bad")
+            return
+        self.adb.serial = self._selected_serial()
+
+        self._busy(True)
+        self.lbl_gplay.configure(text="检查中…", fg=FG_DIM)
+        self.log("")
+        self.log("== Google Play：探测 → 按需安装 → 拉起验证 ==", "ok")
+        base = self._gp_base()
+
+        def work():
+            try:
+                g = gplay.Gp(self.adb, base_dir=base,
+                             log=lambda s: self.q.put(("log", "  " + s, "dim")))
+                r = g.enable()
+            except Exception as e:
+                r = {"ok": False, "stage": "failed",
+                     "detail": f"{type(e).__name__}: {e}",
+                     "state": None, "need_manual": False}
+            self.q.put(("gplay", r))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_gplay(self, r):
+        self._busy(False)
+        st = r.get("state")
+        stage = r.get("stage") or "failed"
+        detail = str(r.get("detail") or "")
+
+        if st is not None:
+            self.log("  现状：商店 "
+                     + (f"已装 {st.store_version}" if st.store_installed else "未装")
+                     + " / GMS " + ("在" if st.gms_installed else "缺")
+                     + " / 账号 " + f"{len(st.accounts)} 个"
+                     + " / 前台 " + (st.top or "未知"), "dim")
+        for line in detail.splitlines():
+            if line.strip():
+                self.log("  " + line, "dim")
+
+        if r.get("ok"):
+            self.lbl_gplay.configure(text="商店可用", fg=OK_C)
+            self.set_status("Google Play 已可用", OK_C)
+            return
+
+        if stage == "need_login":
+            self.lbl_gplay.configure(text="等设备上登录", fg=WARN_C)
+            self.set_status("去设备上登录 Google 账号", WARN_C)
+            if messagebox:
+                messagebox.showinfo(
+                    "登录 Google 账号",
+                    "已在设备上打开「添加账号」页。\n\n"
+                    "登录 Google 账号并完成验证后，ONYX 会自己打开 Play 商店的开关，\n"
+                    "再点一次「装 Google Play」就能确认。")
+            return
+
+        self.lbl_gplay.configure(text=f"未完成（{stage}）", fg=BAD_C)
+        self.set_status(f"Google Play 未完成：{stage}", BAD_C)
+
     def start_one_click(self):
         """
         一条命令跑完全程：
@@ -2277,6 +2406,10 @@ def _echo_log(logp, tail=200):
 def main():
     ap = argparse.ArgumentParser(description=APP_NAME)
     ap.add_argument("--check", action="store_true", help="只检测设备，不改动")
+    ap.add_argument("--gplay", action="store_true",
+                    help="安装/启用 Google Play（不碰 root）")
+    ap.add_argument("--apk", default=None,
+                    help="--gplay 时指定商店 APK；不给就按 assets/apk -> apk 顺序找")
     ap.add_argument("--root", type=int, metavar="N", help="无界面跑 N 轮")
     ap.add_argument("--sysadmin", action="store_true", help="要求 CAP_SYS_ADMIN")
     ap.add_argument("--magisk", action="store_true", help="顺手装 Magisk（会 patch boot 并重启）")
@@ -2360,7 +2493,7 @@ def main():
             pass
         return rc
 
-    if args.check or args.root or args.auto:
+    if args.check or args.root or args.auto or args.gplay:
         attach_console()
         return cli_main(args)
     return gui_main(args.port)
