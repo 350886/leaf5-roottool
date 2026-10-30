@@ -231,8 +231,10 @@ Key/IV 解，头是 `PK\x03\x04`、第一个 entry 是 `META-INF/com/android/`�
 
 ## Google Play（和 root 无关的一条腿）
 
-界面上第四个按钮「装 Google Play」，命令行 `--gplay`。**不需要先 root**，
-root 过的机器也不需要再走一遍。这条腿不进 root 流程，`precheck_root()` 也管不着它。
+界面上的「装 Google Play」按钮、命令行 `--gplay`，**都只在集成版
+（`Leaf5RootTool_gplay.exe`）里存在** —— 普通版那一行根本不画，参数也直接拒。
+**不需要先 root**，root 过的机器也不需要再走一遍。这条腿不进 root 流程，
+`precheck_root()` 也管不着它。
 
 ### 固件里其实带了 GMS，别去下三件套
 
@@ -316,22 +318,36 @@ launch_store()      am start -W + 等 3 秒 + 读 topResumedActivity，两个判
 
 打包时**同时出两个 EXE**，并排放着，按场景挑：
 
-| 文件 | 体积 | 商店 APK | 什么时候用 |
-|---|---|---|---|
-| `Leaf5RootTool.exe` | 37 MB | 不带，靠外面 `apk\` 目录 | 自己机器上用，或者不想让 EXE 变胖 |
-| `Leaf5RootTool_gplay.exe` | 约 101 MB | **内置**，启动时解到临时目录 | 发给别人 / 换机器，单文件就能装商店 |
+| 文件 | 体积 | 商店 APK | 界面上有「装 Google Play」 | 什么时候用 |
+|---|---|---|---|---|
+| `Leaf5RootTool.exe` | 37.0 MB | 不带 | **没有这一行** | 自己机器上用，或者不想让 EXE 变胖 |
+| `Leaf5RootTool_gplay.exe` | 75.8 MB | **内置**，启动时解到临时目录 | 有 | 发给别人 / 换机器，单文件就能装商店 |
 
-两个版本功能完全一样，区别只有"APK 从哪来"。带版多出来的 64 MB 就是那个 APK 本身
-（APK 已经是 zip，再压没有意义，所以体积是实打实加上的）。
+**普通版没有那个按钮，也没有 `--gplay`。** 不是藏起来 —— 是完全不画：第四行
+（「谷歌服务？」+ 按钮 + 状态标签）整块不生成，窗口高度跟着少 28px。命令行加
+`--gplay` 会直接退：
+
+```
+[-] 这是普通版 EXE，没有集成 Google Play（也没有内置商店 APK）
+    用同目录的 Leaf5RootTool_gplay.exe，或 python build.py --gp 单独出一个
+```
+
+判据是**包内一个空标记文件 `assets/gp_ui.on`**，由 `build.py` 在打包集成版时
+`--add-data` 塞进去，`roottool.py` 启动读一次（`_gp_ui_enabled()`）。不用"包里
+有没有 APK"当判据 —— 那玩意会变：用户往 EXE 旁边丢个 `apk\` 目录，按体积判断
+的逻辑就会被搅乱，而"界面该不该出现这个按钮"是构建时就说定的事。
+
+带版那 38.8 MB 的增量不是 64 MB 的 APK 本身：PyInstaller 的 `--add-data` 会对条目
+做 zlib，APK 里 store 方式没压的那些条目被压到约 38 MB，运行时解出来逐字节一致。
 
 ```bash
 python build.py              # 两个都出
-python build.py --no-gp      # 只出 37 MB 那个
+python build.py --no-gp      # 只出 37 MB 那个（界面无商店按钮）
 python build.py --gp         # 只出带包的
 python build.py --apk X.apk  # 指定打进带版里的包
 ```
 
-打包前把商店 APK 放进 `assets/apk/`（这个目录不进仓库，`.`gitkeep` 留着）。
+打包前把商店 APK 放进 `assets/apk/`（这个目录不进仓库，`.gitkeep` 留着）。
 `--no-gp` 不需要这个目录。
 
 ### APK 放哪（不带包的那个版本）

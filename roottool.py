@@ -132,6 +132,22 @@ def resource_path(*parts):
     return os.path.join(base, *parts)
 
 
+def _gp_ui_enabled():
+    """
+    本 EXE 是否集成了 Google Play —— 编译期定的，不在运行期猜。
+
+    带版打包时 build.py 往包里塞一个空标记 assets/gp_ui.on；普通版没有这个
+    标记，界面上就不出现那一行（按钮 + 状态标签），窗口也少 28px。
+    源码直接跑（没 frozen）一律当集成版处理，开发时免得看不见按钮。
+    """
+    if not getattr(sys, "frozen", False):
+        return True
+    return os.path.isfile(resource_path("assets", "gp_ui.on"))
+
+
+GP_ENABLED = _gp_ui_enabled()
+
+
 def app_data_dir():
     base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
     return os.path.join(base, "Leaf5RootTool")
@@ -1544,6 +1560,10 @@ def cli_main(args):
                 return
 
     if args.gplay:
+        if not GP_ENABLED:
+            emit("[-] 这是普通版 EXE，没有集成 Google Play（也没有内置商店 APK）")
+            emit("    用同目录的 Leaf5RootTool_gplay.exe，或 python build.py --gp 单独出一个")
+            return 2
         if gplay is None:
             emit("[-] 缺少 gp.py，装商店功能不可用")
             return 2
@@ -1641,7 +1661,8 @@ class App:
         self.devices = []
 
         root.title(f"{APP_NAME} v{APP_VER}")
-        root.geometry("900x720")
+        # 普通版少了 Google Play 那一行，高度跟着收 28px，否则底部空一条
+        root.geometry("900x720" if GP_ENABLED else "900x692")
         root.minsize(780, 580)
         root.configure(bg=BG)
 
@@ -1779,15 +1800,19 @@ class App:
 
         # 第四行：Google Play。和 root 完全独立的一条腿 ——
         # 装商店不需要先 root，root 过的机器也不需要再走一遍。
-        opt4 = tk.Frame(act, bg=BG2)
-        opt4.pack(fill="x", padx=10, pady=(0, 10))
-        tk.Label(opt4, text="谷歌服务？", bg=BG2, fg=FG_DIM,
-                 font=("Microsoft YaHei UI", 9)).pack(side="left")
-        self.btn_gplay = self._btn(opt4, "装 Google Play", self.start_gplay, w=14)
-        self.btn_gplay.pack(side="left", padx=6)
-        self.lbl_gplay = tk.Label(opt4, text="", bg=BG2, fg=FG_DIM,
-                                  font=("Microsoft YaHei UI", 8))
-        self.lbl_gplay.pack(side="left", padx=6)
+        # 只有集成版才画这一行：普通版没有内置 APK，留个按钮只会点了报错。
+        self.btn_gplay = None
+        self.lbl_gplay = None
+        if GP_ENABLED:
+            opt4 = tk.Frame(act, bg=BG2)
+            opt4.pack(fill="x", padx=10, pady=(0, 10))
+            tk.Label(opt4, text="谷歌服务？", bg=BG2, fg=FG_DIM,
+                     font=("Microsoft YaHei UI", 9)).pack(side="left")
+            self.btn_gplay = self._btn(opt4, "装 Google Play", self.start_gplay, w=14)
+            self.btn_gplay.pack(side="left", padx=6)
+            self.lbl_gplay = tk.Label(opt4, text="", bg=BG2, fg=FG_DIM,
+                                      font=("Microsoft YaHei UI", 8))
+            self.lbl_gplay.pack(side="left", padx=6)
 
         # 进度条。日志区是 expand=True 的，不给进度条固定高度就会被挤成一条线
         pf = tk.Frame(self.root, bg=BG, height=12)
@@ -1930,8 +1955,11 @@ class App:
 
     def _busy(self, b):
         state = "disabled" if b else "normal"
-        for w in (self.btn_one, self.btn_detect, self.btn_deploy, self.btn_root,
-                  getattr(self, "btn_gplay", self.btn_root)):
+        ws = [self.btn_one, self.btn_detect, self.btn_deploy, self.btn_root]
+        # 普通版没有这个按钮，属性是 None，塞进列表会炸
+        if self.btn_gplay is not None:
+            ws.append(self.btn_gplay)
+        for w in ws:
             w.configure(state=state)
         for w in (self.chk_magisk, self.chk_module):
             w.configure(state=state)

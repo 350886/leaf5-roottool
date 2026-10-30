@@ -133,6 +133,21 @@ def gp_apk_from_dir():
     return max(cands, key=os.path.getsize)
 
 
+def gp_flag_file():
+    """
+    集成版的空标记文件，打进包内 assets/gp_ui.on。
+
+    roottool.py 的 _gp_ui_enabled() 只看这个文件在不在 —— 不拿「包里有没有
+    APK」当判据：用户自己在 EXE 旁放个 apk 目录就会把那套逻辑搅乱，
+    而界面该不该出现按钮是构建时就说定的事。
+    """
+    path = os.path.join(HERE, "build", "gp_ui.on")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="ascii"):
+        pass
+    return path
+
+
 def main():
     onedir = "--onedir" in sys.argv
     do_sign = "--sign" in sys.argv
@@ -294,6 +309,8 @@ def main():
         if apk:
             # 打进 assets/apk/，运行时 gp.bundled_apk_dir() 从 _MEIPASS 下的同一路径读
             args += ["--add-data", f"{apk};assets/apk"]
+            # 标记：只有集成版带它，普通版界面不画「装 Google Play」这一行
+            args += ["--add-data", f"{gp_flag_file()};assets"]
         args.append(os.path.join(HERE, "roottool.py"))
 
         print(f"\n[*] 打包 {name} …")
