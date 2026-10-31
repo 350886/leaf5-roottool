@@ -28,7 +28,7 @@ GP_NAME = "Leaf5RootTool_gplay"
 # 签名证书的 Subject，和文件名解耦：EXE 属性里显示的就是这个字符串。
 # 换成自签名证书后，别人从 EXE 里能读到的只有这一个名字，不含公司名/个人信息。
 # 想换：set LEAF5_SIGN_CN=CN=你自己的名字 后跑 --sign，或改这里重新生成证书。
-SIGN_CN = "Leaf5 Root Tool"
+SIGN_CN = "SWT"
 VERSION = (1, 1, 4, 0)
 
 ADB = ["adb.exe", "AdbWinApi.dll", "AdbWinUsbApi.dll"]
