@@ -25,6 +25,10 @@ NAME = "Leaf5RootTool"
 # 带 Google Play 的版本单独一个名字 —— 两个 EXE 要能并排放，
 # 用户一眼看出哪个不用带 apk 文件夹
 GP_NAME = "Leaf5RootTool_gplay"
+# 签名证书的 Subject，和文件名解耦：EXE 属性里显示的就是这个字符串。
+# 换成自签名证书后，别人从 EXE 里能读到的只有这一个名字，不含公司名/个人信息。
+# 想换：set LEAF5_SIGN_CN=CN=你自己的名字 后跑 --sign，或改这里重新生成证书。
+SIGN_CN = "Leaf5 Root Tool"
 VERSION = (1, 1, 4, 0)
 
 ADB = ["adb.exe", "AdbWinApi.dll", "AdbWinUsbApi.dll"]
@@ -355,18 +359,34 @@ def sign(exe):
         print("[!] 没找到 signtool，跳过签名")
         return 1
 
-    # 先找带私钥的代码签名证书
-    ps = ("Get-ChildItem Cert:\\CurrentUser\\My -CodeSigningCert | "
-          "Where-Object { $_.HasPrivateKey } | Select-Object -First 1 -ExpandProperty Thumbprint")
+    # 证书库里可能同时存在别的项目的证书（例如公司内部系统的），
+    # 直接 Select -First 1 会抓到哪张取决于枚举顺序 —— 那样会把本工具的
+    # 发布者名字签成别人。所以按 Subject 点名找，找不到才回落第一张。
+    # 想换发布者名字：设环境变量 LEAF5_SIGN_CN，例如 "CN=我自己"，再跑 --sign。
+    want_cn = os.environ.get("LEAF5_SIGN_CN", "CN=" + SIGN_CN).strip()
+    if not want_cn.upper().startswith("CN="):
+        want_cn = "CN=" + want_cn
+    cn_lit = want_cn.replace("'", "''")  # PowerShell 单引号串内转义
+    ps = (
+        "$all = Get-ChildItem Cert:\\CurrentUser\\My -CodeSigningCert "
+        "| Where-Object { $_.HasPrivateKey }; "
+        f"$t = $all | Where-Object {{ $_.Subject -eq '{cn_lit}' }} | Select-Object -First 1; "
+        "if (-not $t) { $t = $all | Select-Object -First 1 }; "
+        "if ($t) { $t.Subject + '|' + $t.Thumbprint }"
+    )
     try:
         p = subprocess.run(["powershell", "-NoProfile", "-Command", ps],
                            capture_output=True, text=True, timeout=60)
-        thumb = (p.stdout or "").strip()
+        out = (p.stdout or "").strip()
     except Exception:
-        thumb = ""
-    if not thumb:
+        out = ""
+    if not out:
         print("[!] 当前用户证书库没有代码签名证书，跳过签名")
         return 1
+    used_subject, _, thumb = out.partition("|")
+    if used_subject.strip() != want_cn:
+        print(f"[!] 没找到 {want_cn}，回落到现有证书：{used_subject}")
+    print(f"[*] 签名证书：{used_subject}")
 
     # 用 PowerShell 调，避免 Git Bash 把 /sha1 /fd 这类参数当路径转换
     cmd = (f"& '{signtool}' sign /sha1 {thumb} /fd SHA256 /tr http://timestamp.digicert.com "
