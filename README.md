@@ -140,6 +140,13 @@ ONYX BOOX Leaf5 的一键 root 客户端。内嵌 adb，不依赖机器上装没
 | ONYX 其他机型 | 不同内核 | 要重新适配 | 向导重编 + 4 个值；SoC 变了还要换 EDL programmer |
 | 非 ONYX | — | 不适用 | 链子本身是通用的，但机型常量、分区布局、sepolicy 全要重做 |
 
+表里「ONYX 其他机型」两行不是猜的：Leaf5 / Tab8C / Tab8 / Tab10 四台机器的原厂固件
+都拆过、内核逐项对照过，实测数据在下面
+[「四款机型固件实测」](#四款机型固件实测leaf5--tab8c--tab8--tab10)。
+一句话结论：Tab 系列的 SoC 是 BENGAL/SCUBA（SM6115/SM4250 系列），跟 Leaf5 的 LITO
+不是一家，9008 programmer 不通用；但三款 Tab 是 Android 11 **userdebug** 包，
+大概率 `adb root` 就能成，压根用不上 exploit。
+
 ### 同内核、不同机型：只有三处会变
 
 | 部分 | 为什么变 | 工具怎么兜 |
@@ -223,9 +230,113 @@ payload-dumper-go -p boot payload.bin     # 或 cyxx/extract_android_ota_payload
 注意：`payload.bin` 里是 `boot` 分区本体，A/B 机器刷回时按当前槽写
 （`boot_a` 或 `boot_b`），别两个槽都写。
 
-实测到哪一步：接口返回与 upx 解密这两步在本机跑过 —— 拉前 4 KB 用 Leaf5 的
-Key/IV 解，头是 `PK\x03\x04`、第一个 entry 是 `META-INF/com/android/`。
-`payload.bin` 提取那步没跑（1.74 GiB 全量没下），命令按工具用法写的。
+实测到哪一步：接口返回、upx 解密、`payload.bin` 解析、boot 提取这四步都在本机跑过
+—— Leaf5 全量 1,867,290,835 字节，md5 `af649ee4…` 与接口报的一致；解出来的 zip
+`testzip()` 全过；`payload.bin` 里的 `boot` 分区提出来的内核 banner 是
+`4.19.157-perf-g77c132eccfab-dirty #38`，与设备 `uname -r` 对得上。
+
+### 四款机型固件实测（Leaf5 / Tab8C / Tab8 / Tab10）
+
+四台机器的原厂包全部下齐、解密、提出 `boot` 里的内核，逐项对照。下面每个数字都是本机
+跑出来的，`tools/firmware/` 下三个脚本可以原样复现。
+
+| 设备 | 固件 | Android | 内核串 | SoC（内嵌 config） | Image |
+|---|---|---|---|---|---|
+| Leaf5 | 4.2.3-rel_0928 | 13 `user` | `4.19.157-perf-g77c132eccfab-dirty` #38 | `ARCH_LITO` + `ARCH_LAGOON`（SM6350） | 60,735,504 未压缩 |
+| Tab8C | 4.2-rel_0605 | 11 `userdebug` | `4.19.157-perf-ge2582afab8ec-dirty` #12 | `ARCH_BENGAL` + `ARCH_SCUBA`（SM6115/SM4250 系列） | 72,483,328（gzip 后 41,300,047） |
+| Tab8 | 4.2-rel_0603 | 11 `userdebug` | `4.19.157-perf-ge2582afab8ec-dirty` #11 | 同上 | 72,483,328（gzip 后 41,253,074） |
+| Tab10 | 4.2-rel_0630 | 11 `userdebug` | `4.19.157-perf-g45e1596201e0-dirty` #41 | 同上 | 72,483,328（gzip 后 41,303,481） |
+
+Android 版本和 `pre-device` 取自包内 `META-INF/com/android/metadata`：Leaf5 是
+`pre-device=Leaf5` / `...:user/release-keys`，三款 Tab 全是 `pre-device=BOOX` /
+`...:userdebug/release-keys`。SoC 取自内核内嵌 config 里的 `CONFIG_ARCH_*`。
+
+Image 逐字节对比（Leaf5 比三款 Tab 短 11.7 MB，只比前 60,735,504 字节）：
+
+| A | B | 差异字节 / 比对长度 | 差异占比 |
+|---|---|---:|---:|
+| Leaf5 | Tab8C | 59,115,524 / 60,735,504 | **97.33%** |
+| Leaf5 | Tab8 | 59,115,566 / 60,735,504 | 97.33% |
+| Leaf5 | Tab10 | 59,116,713 / 60,735,504 | 97.33% |
+| Tab8C | Tab8 | 793,047 / 72,483,328 | **1.09%** |
+| Tab8C | Tab10 | 43,727,721 / 72,483,328 | **60.33%** |
+| Tab8 | Tab10 | 43,734,126 / 72,483,328 | 60.34% |
+
+下面这几项四台逐项一致（`CONFIG_IKCONFIG=y`，能整份读出来；`ARCH_*` 那几个是
+区别所在，见下一条）：
+`ARM64_VA_BITS=39`、`ARM64_PAGE_SHIFT=12`、`VMAP_STACK=y`、`NR_CPUS=8`、`SLUB=y`、
+`RANDOMIZE_BASE=y`、`ARM64_SW_TTBR0_PAN=y`、`HARDENED_USERCOPY=y`、`PREEMPT=y`。
+
+#### 一、Tab 系列和 Leaf5 不是一个 SoC 家族
+
+| | `CONFIG_ARCH_LITO` | `CONFIG_ARCH_LAGOON` | `CONFIG_ARCH_BENGAL` | `CONFIG_ARCH_SCUBA` |
+|---|---|---|---|---|
+| Leaf5 | `y` | `y` | — | — |
+| Tab8C / Tab8 / Tab10 | — | — | `y` | `y` |
+
+后果很直接：`assets/` 里那两份 firehose programmer（`lito_op_n10_fhprg.bin`、
+`lito_moto_fhprg.bin`）的 HW_ID 是 lito 的，**对三款 Tab 无效**。也就是
+「设备没 root、走 9008 读 boot」这条支路在 Tab 上是断的 —— 不是工具不会用，是
+programmer 不对板。Tab 想拿 boot，只能从官方包里解（本页上一节的办法），
+或者设备本来就是 userdebug 能 `adb root`（见下一条）。
+
+#### 二、三款 Tab 是 Android 11 的 userdebug 包
+
+`post-build=ONYX/BOOX/BOOX:11/RKQ1.210614.002/200:userdebug/release-keys`。
+userdebug 一般 `ro.debuggable=1`，那样 `adb root` 直接就是 root，**根本不需要 exploit**，
+也不需要先解锁、不需要 touch boot。
+
+这件事比"适配载荷"省事一个数量级，所以顺序应该是：
+
+```bash
+adb shell getprop ro.debuggable     # 1 就直接赢了
+adb root && adb shell id            # uid=0(root)
+```
+
+`ro.debuggable=0` 才谈得上往下走。**这一条没有真机验证**（手上只有 Leaf5），
+写在这里是因为包本身就是 userdebug —— 值得先花 10 秒试一下。
+
+#### 三、Tab8C 和 Tab8 是同一次源码构建，Tab10 不是
+
+Tab8C 与 Tab8 的 commit 都是 `ge2582afab8ec`，只差增量号（#12 / #11）和编译时间，
+Image 差异 **1.09%**（793,047 字节）。这点零头基本落在 build-id、编译时间戳、
+`#11` vs `#12` 这类字符串上，符号地址大面积一致 —— **一份载荷大概率同时吃这两台**。
+判据仍然是符号序列哈希（`adapter.py` 的 `pick_payload()`），不是这里的差异率。
+
+Tab10 是另一个 commit（`g45e1596201e0`），与 Tab8C/Tab8 差 **60.33%**，
+两台机器之间不能互相顶，各配各的。
+
+#### 四、内核前提齐，但 Magisk 那条腿在 Tab 上基本不通
+
+4.19.157 + 上面那组 config 与 Leaf5 完全同构 —— exploit 依赖的 `mm_struct`/`cred`
+布局前提、SLUB、PAN、`HARDENED_USERCOPY` 都在同一个配置面上，所以
+「跑一遍向导重编载荷、临时 root 有可能过」是有依据的，不是碰运气。
+
+但 `services.jar` 的 DEX 补丁点 `0x2b2fee` 是 **Android 13 framework** 里的位置，
+三款 Tab 是 Android 11 framework，同一偏移几乎不可能对上。对不上时
+`guard` 会抛 `AdbError` 停下（`roottool.py:238`），不会写坏文件，但 Magisk 这条腿
+就止步于此 —— 要支持得另做 A11 的补丁点。
+
+所以在 Tab 上，现实目标排序是：`adb root`（若 userdebug 成立）→ 临时 root →
+Magisk 持久化（基本别指望）。
+
+#### 怎么复现
+
+```bash
+python tools/fwq.py Tab8C                    # 拿直链和 md5
+python DeBooxUpx.py Tab8C x.upx x.zip        # 解密
+python tools/firmware/kcheck.py x.zip        # 内核串 + Image header + config
+python tools/firmware/kdiff.py A.zip B.zip   # 两两逐字节差异
+```
+
+`kdiff.py` 会把 `payload.bin` 落到 `_img/`（约 1.8 GB/包），处理完自动删；解出来的
+Image 留在 `tools/firmware/_img/` 供反复比对（已在 `.gitignore` 里）。
+`zstd` / `lz4` 压缩的内核要 `pip install zstandard lz4`，这四台都是 gzip 或未压缩，
+不用装。
+
+**还没验证的三条**：userdebug 是否真能 `adb root`；Android 11 的 `services.jar`
+补丁点在哪；BENGAL 平台该配哪个 firehose programmer。手上没有这三台机器，
+谁有条件先试，结论可以直接补进来。
 
 ---
 
@@ -967,6 +1078,9 @@ assets/                 运行时资源
   adb/ magisk/ apk/ *.bin zadig.exe payload/preload.so   ← 自己按下面的表放
 
 build/                  PyInstaller 工作目录（spec / 版本资源 / 中间树），生成物不进仓库
+tools/firmware/         固件分析：payload.bin 解析 / 内核对照 / Image 逐字节差异
+tools/fetch_deps.py     拉齐 assets 下缺的二进制
+tools/fwq.py            查官方固件接口，拿直链和 md5
 _test_dump/             guard 闸门与 GUI 的离线自测（不接设备也能跑）
 ```
 

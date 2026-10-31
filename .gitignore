@@ -32,6 +32,9 @@ assets/apk/*
 !assets/apk/.gitkeep
 
 # ── 备份 / 中间产物 ─────────────────────────────────────────────────
+# kdiff.py 解出来的 Image 与落盘的 payload.bin：一份 70 MB、一份 1.8 GB，
+# 纯中间产物，随时能由原厂包重建
+tools/firmware/_img/
 _bak_*/
 *.orig
 *.orig2
