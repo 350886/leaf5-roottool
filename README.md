@@ -2,7 +2,18 @@
 
 ONYX BOOX Leaf5 的一键 root 客户端。内嵌 adb，不依赖机器上装没装 [platform-tools](https://developer.android.com/tools/releases/platform-tools)。
 
-> **只对一台机器成立**：ONYX BOOX Leaf5 / 固件 `4.2.3-rel_0928_656b72278` /
+这个仓库里是**两件不同的事**，覆盖机型不一样：
+
+| | 是什么 | 覆盖机型 | 在哪 |
+|---|---|---|---|
+| ① | 一键 root（`Leaf5RootTool.exe`） | **只有 Leaf5** | 本页往下，全流程 |
+| ② | 原厂固件内核解析与 root 可行性 | **Leaf5 / Tab8C / Tab8 / Tab10 四台** | [四款机型固件实测](#四款机型固件实测leaf5--tab8c--tab8--tab10) |
+
+Tab8C / Tab8 / Tab10 **没有对应的 EXE**。那三台的原厂包已经全部下齐、解密、提出了内核，
+结论（BENGAL 平台 programmer 不对板、userdebug 可能直接 `adb root`、Android 11 的
+`services.jar` 补丁点对不上）都在 ② 那一节，附逐字节差异和复现脚本。
+
+> **一键 root（①）只对一台机器成立**：ONYX BOOX Leaf5 / 固件 `4.2.3-rel_0928_656b72278` /
 > 内核 `4.19.157-perf-g77c132eccfab-dirty` #38。
 > 型号或内核对不上会被**拦在动设备之前** —— 载荷里 62 个符号偏移和
 > `services.jar` 的补丁点全是硬编码的，换一版内核就是 kernel panic。
