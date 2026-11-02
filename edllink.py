@@ -422,7 +422,38 @@ class Edl:
 
 
 # ----------------------------------------------------------------------
-# Session：一次 9008 连接里做完 printgpt / r / reset
+# GPT 文本解析
+# ----------------------------------------------------------------------
+# edl 的 printgpt 每行形如：
+#   "boot_b:              Offset 0x0000000040000000, Length 0x0000000004000000, ..., Active True"
+# 分区名右补空格到 20 列、名字后带冒号。冒号做可选，防不同版本格式差异。
+GPT_RE = re.compile(
+    r"^\s*([^\s:]+):?\s+Offset\s+(0x[0-9a-fA-F]+),"
+    r"\s+Length\s+(0x[0-9a-fA-F]+)"
+    r"(?:.*?Active\s+(True|False))?", re.M)
+
+
+def parse_gpt(text):
+    """printgpt 输出 → {分区名: dict(offset, length, active)}。
+
+    放在 edllink 里而不是 edlman：写分区前要用它核对「分区存在 + 装得下」，
+    而 edlman 会 import edllink，反向 import 就成环。
+    """
+    parts = {}
+    for m in GPT_RE.finditer(text or ""):
+        name = m.group(1)
+        if name in ("GPT", "Parsing", "Table"):
+            continue
+        parts[name] = dict(
+            offset=int(m.group(2), 16),
+            length=int(m.group(3), 16),
+            active=(m.group(4) == "True") if m.group(4) else None,
+        )
+    return parts
+
+
+# ----------------------------------------------------------------------
+# Session：一次 9008 连接里做完 printgpt / r / w / reset
 # ----------------------------------------------------------------------
 class Session:
     """
@@ -647,6 +678,71 @@ class Session:
                 on_line("  %s %d/%d 字节  %.1fs" % (
                     part, min(expect, pos * ss), expect, time.time() - t0))
         return out_path
+
+    def write(self, part, image_path, on_line=None, on_progress=None,
+              timeout=1800):
+        """
+        把镜像写进分区。返回 dict(partition, size, sectors, seconds)。
+
+        为什么写之前自己先 printgpt，而不是直接甩给 edl 的 `w`：
+
+        `w` 分支会 detect_partition，找不到就 `self.error()` 然后 continue ——
+        **返回 False，但不会告诉你「分区表里实际有哪些名字」**。分区名写错
+        （boot_b 写成 bootb / boot-B）是刷机最常见的失败原因，错误信息里带上
+        候选名字，比事后翻 GPT 快得多。
+
+        容量检查也是同理：edl 会拒（sectors > partition.sectors），但它报的是
+        "X has N sectors but partition only has M"，没说这意味着写进去会截断。
+        这里提前拦，并且不写任何字节。
+
+        写完不做读回比对 —— 那是 edlman.write_partition 的活，它要在同一个
+        连接里接着读回来算 sha256，读回不符才好决定回滚。
+        """
+        if not self.fh:
+            raise EdlError("会话没建立，先调 open()")
+        image_path = os.path.abspath(image_path)
+        if not os.path.isfile(image_path):
+            raise EdlError("镜像不存在：%s" % image_path)
+        size = os.path.getsize(image_path)
+        if size <= 0:
+            raise EdlError("镜像是空文件：%s" % image_path)
+
+        ss = int(self.fh.firehose.cfg.SECTOR_SIZE_IN_BYTES) or 512
+        need = (size + ss - 1) // ss
+
+        buf = []
+        self.printgpt(on_line=buf.append, timeout=90)
+        gpt = parse_gpt("\n".join(buf))
+        e = gpt.get(part)
+        if not e:
+            # 常见笔误：大小写、少了后缀、把 slot 写进名字。给近似项而不是空手。
+            key = part.lower().rstrip("_ab")
+            near = [n for n in gpt if n.lower().startswith(key[:5])][:8]
+            raise EdlError(
+                "分区表里没有 %s。%s"
+                % (part,
+                   ("相近的：" + "、".join(near)) if near
+                   else "分区表共读到 %d 项" % len(gpt)))
+        room = e["length"] // ss
+        if need > room:
+            raise EdlError(
+                "镜像 %d 字节（%d 扇区）大于分区 %d 字节（%d 扇区）；"
+                "写入会覆盖到相邻分区，已中止，分区未改动"
+                % (size, need, e["length"], room))
+
+        self.options["<partitionname>"] = part
+        self.options["<filename>"] = image_path
+
+        def fn():
+            with Session._Route(on_line, on_progress):
+                return self.fh.handle_firehose("w", self.options)
+
+        rc, code, dt = self._run(fn, timeout, "写 %s " % part)
+        if rc is False:
+            raise EdlError("写 %s 失败（edl 返回 False，rc=%s）" % (part, code))
+        if rc is None and code:
+            raise EdlError("写 %s 中断（SystemExit rc=%s）" % (part, code))
+        return dict(partition=part, size=size, sectors=need, seconds=dt)
 
     def _drain(self, rounds=256):
         """

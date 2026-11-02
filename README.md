@@ -617,12 +617,50 @@ exploit 拿到 root 后，热装 Magisk：
 写回用 `dd` 而不是 fastboot：ONYX 的 abl 把 flash 命令裁了，`fastboot flash boot_b`
 一律返回 `remote: 'unknown command'`。
 
+**没有 root 时怎么刷 boot —— 走 9008**
+
+`dd` 要 su，fastboot 又被裁了，所以「没 root 又要写 boot」只剩 9008 这一条。它跟
+fastboot 是两条互不相干的通道：fastboot 跑在 abl（厂商可改、可裁）里，9008 是 SoC
+自己的 PBL/SBL 下载模式，走高通 Firehose 协议，裁 fastboot 命令表裁不掉它。
+
+界面：`换了固件 / 内核？` 那一行的 **EDL 刷 boot**。先本地验 `ANDROID!` 头，再确认
+分区（按 `ro.boot.slot_suffix` 走 `boot_b` / `boot_a`），然后设备黑屏重启进 9008。
+
+顺序固定，每步不成立就停、分区一个字节不动：
+
+```
+1. 分区必须在 GPT 里，容量必须装得下镜像
+2. 先读一份原分区到 PC，算 sha256      ← 回滚的唯一依据
+3. 写
+4. 读回镜像长度那一段，sha256 与源文件逐字节比对
+5. 第 4 步不符 → 用第 2 步的备份写回去，然后报错说明「已回滚」
+6. reset 让设备离开下载模式
+```
+
+读回只读镜像长度那一段，不读整个分区：boot_b 96 MB 读一遍约 90 秒，写一遍约 60 秒，
+而分区尾部本来就不该动，读它证明不了更多东西。
+
+命令行同一条路（`--edl` 后面的参数原样透传给 `edlman`）：
+
+```bash
+Leaf5RootTool.exe --edl w boot_b magisk_patched.img          # 只打印计划，不写
+Leaf5RootTool.exe --edl w boot_b magisk_patched.img --yes    # 真写
+Leaf5RootTool.exe --edl w boot_a stock_boot_a.img --yes      # 回滚到原厂
+```
+
+备份落在 `<工具目录>\work\stock_boot_b_<时间戳>.img`，读回的校验副本是同目录的
+`readback_boot_b_<时间戳>.img`。两个都留 —— 只留一个的话，出问题时分不清是
+「写错了」还是「读错了」。
+
 **回滚**：任何一步失败，`backup\` 里那份原版 boot 就是退路：
 
 ```bash
-# 在 PC 上，把留档推回设备再写回分区
+# 有 root：在 PC 上，把留档推回设备再写回分区
 adb push stock_boot_b_YYYYmmdd_HHMMSS.img /sdcard/
 adb shell su -c 'dd if=/sdcard/stock_boot_b_YYYYmmdd_HHMMSS.img of=/dev/block/by-name/boot_b bs=1M'
+
+# 没 root：同一份文件走 9008
+Leaf5RootTool.exe --edl w boot_b backup\stock_boot_b_YYYYmmdd_HHMMSS.img --yes
 ```
 
 **3. 装 AMS 修复模块（可选）**
@@ -1132,8 +1170,8 @@ gp.py                   Google Play 的探测 / 安装 / 启用（独立模块�
 build.py                打包脚本（同时出带包和不带包两个版本）
 
 edlmain.py              firehose 协议层（USB / 串口 / 网络三种后端）
-edllink.py              9008 会话封装（programmer 选择、4MB 分块读、校验重读）
-edlman.py               EDL 子命令：env / slot / gpt / dump / r
+edllink.py              9008 会话封装（programmer 选择、4MB 分块读、写 + 分区容量预检）
+edlman.py               EDL 子命令：env / slot / gpt / dump / r / w / reset
 usbtrace.py             USB 侧实况，绕开 adb 直接问 SetupAPI
 edlclient/              vendored 的 bkerler/edl（去了 .git，只留 Library/Config/Tools）
 

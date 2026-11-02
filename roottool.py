@@ -40,10 +40,12 @@ try:
     import tkinter as tk
     from tkinter import ttk
     from tkinter import messagebox
+    from tkinter import filedialog
 except ImportError:  # 精简版 Python 可能没带 tcl/tk
     tk = None
     ttk = None
     messagebox = None
+    filedialog = None
 
 # ----------------------------------------------------------------------------
 # 常量：设备端布局与已验证的 chain 配置
@@ -51,7 +53,7 @@ except ImportError:  # 精简版 Python 可能没带 tcl/tk
 # ----------------------------------------------------------------------------
 
 APP_NAME = "Leaf5 Root Tool"
-APP_VER = "1.1.6"
+APP_VER = "1.1.7"
 
 # 本工具适配的唯一目标。写在界面上、写进日志、拿来卡住别的机型。
 # 62 个偏移 + services.jar 补丁点全部绑死在这个三元组上，换任何一个都不成立。
@@ -1676,7 +1678,9 @@ class App:
 
         root.title(f"{APP_NAME} v{APP_VER}")
         # 普通版少了 Google Play 那一行，高度跟着收 28px，否则底部空一条
-        root.geometry("900x720" if GP_ENABLED else "900x692")
+        # 每个按钮、每个选项下面都多了「用在什么情况」那一行，纵向比原来多约 160px。
+        # 窗口跟着长高，否则日志区被压成一条缝 —— 日志是唯一的事后证据。
+        root.geometry("900x880" if GP_ENABLED else "900x850")
         root.minsize(780, 580)
         root.configure(bg=BG)
 
@@ -1693,13 +1697,18 @@ class App:
         top = tk.Frame(self.root, bg=BG)
         top.pack(fill="x", **pad)
 
-        tk.Label(top, text="设备", bg=BG, fg=FG, font=("Microsoft YaHei UI", 9)) \
-            .pack(side="left")
+        # 按钮组现在高 92px（按钮 + 两行说明），顶栏跟着变高。
+        # 「设备」标签和下拉框要贴顶，否则会被垂直居中到按钮说明那一行的位置。
+        tk.Label(top, text="设备", bg=BG, fg=FG,
+                 font=("Microsoft YaHei UI", 9)).pack(side="left", anchor="n",
+                                                       pady=(5, 0))
         self.cmb = ttk.Combobox(top, width=44, state="readonly")
-        self.cmb.pack(side="left", padx=8)
+        self.cmb.pack(side="left", padx=8, anchor="n", pady=(3, 0))
 
-        self.btn_refresh = self._btn(top, "刷新设备", self.refresh_devices)
-        self.btn_refresh.pack(side="left")
+        g, self.btn_refresh, _ = self._btn_group(
+            top, "刷新设备", self.refresh_devices,
+            "重扫 adb / fastboot", when="插拔线或换机后")
+        g.pack(side="left")
 
         # 状态行
         st = tk.Frame(self.root, bg=BG)
@@ -1716,51 +1725,89 @@ class App:
         row = tk.Frame(act, bg=BG2)
         row.pack(fill="x", padx=10, pady=10)
 
-        self.btn_one = self._btn(row, "一键全自动", self.start_one_click,
-                                 primary=True, w=14)
-        self.btn_one.pack(side="left")
+        g, self.btn_one, _ = self._btn_group(
+            row, "一键全自动", self.start_one_click,
+            "检测→部署→Root", when="第一次连这台机，四步串跑",
+            primary=True, w=14)
+        g.pack(side="left", padx=(0, 10))
 
-        self.btn_detect = self._btn(row, "检测", self.start_detect)
-        self.btn_detect.pack(side="left", padx=6)
-        self.btn_deploy = self._btn(row, "部署载荷", self.start_deploy)
-        self.btn_deploy.pack(side="left")
-        self.btn_root = self._btn(row, "开始 Root", self.start_root)
-        self.btn_root.pack(side="left", padx=6)
-        self.btn_stop = self._btn(row, "停止", self.stop, danger=True)
-        self.btn_stop.pack(side="left")
+        g, self.btn_detect, _ = self._btn_group(
+            row, "检测", self.start_detect,
+            "只读，不改设备", when="先摸清设备状态")
+        g.pack(side="left", padx=(0, 10))
+        g, self.btn_deploy, _ = self._btn_group(
+            row, "部署载荷", self.start_deploy,
+            "推 so 与脚本到 tmp", when="Root 报缺文件时")
+        g.pack(side="left", padx=(0, 10))
+        g, self.btn_root, _ = self._btn_group(
+            row, "开始 Root", self.start_root,
+            "按轮数跑 exploit", when="已部署、想单独重跑")
+        g.pack(side="left", padx=(0, 10))
+        g, self.btn_stop, _ = self._btn_group(
+            row, "停止", self.stop, "中断当前任务",
+            when="卡住或想放弃", danger=True)
+        g.pack(side="left")
 
-        # 选项行
+        # 选项行。每组下面两行字：这一项改什么、什么情况下才动它。
+        # 选项比按钮更需要交代条件 —— 勾错了不报错，只是成功率悄悄变低。
         opt = tk.Frame(act, bg=BG2)
         opt.pack(fill="x", padx=10, pady=(0, 10))
 
-        tk.Label(opt, text="轮数", bg=BG2, fg=FG, font=("Microsoft YaHei UI", 9)).pack(side="left")
-        self.spin_tries = tk.Spinbox(opt, from_=1, to=12, width=4,
-                                     bg=BG3, fg=FG, insertbackground=FG,
-                                     buttonbackground=BG3, relief="flat",
-                                     font=("Consolas", 10))
-        self.spin_tries.delete(0, "end")
-        self.spin_tries.insert(0, "3")
-        self.spin_tries.pack(side="left", padx=(6, 18))
+        def _mk_tries(box):
+            f = tk.Frame(box, bg=BG2)
+            tk.Label(f, text="轮数", bg=BG2, fg=FG,
+                     font=("Microsoft YaHei UI", 9)).pack(side="left")
+            self.spin_tries = tk.Spinbox(f, from_=1, to=12, width=4,
+                                         bg=BG3, fg=FG, insertbackground=FG,
+                                         buttonbackground=BG3, relief="flat",
+                                         font=("Consolas", 10))
+            self.spin_tries.delete(0, "end")
+            self.spin_tries.insert(0, "3")
+            self.spin_tries.pack(side="left", padx=(6, 0))
+            return f
+
+        self._opt_group(opt, _mk_tries, "最多抽几次 cred",
+                        when="勾了 CAP_SYS_ADMIN 时调高"
+                        ).pack(side="left", padx=(0, 18))
 
         self.var_auto = tk.BooleanVar(value=True)
-        tk.Checkbutton(opt, text="自动适配内核（失败后重编载荷）", variable=self.var_auto,
-                       bg=BG2, fg=FG, selectcolor=BG3, activebackground=BG2,
-                       activeforeground=FG, font=("Microsoft YaHei UI", 9),
-                       highlightthickness=0, bd=0).pack(side="left", padx=(0, 16))
+        self._opt_group(
+            opt,
+            lambda b: tk.Checkbutton(b, text="自动适配内核（失败后重编载荷）",
+                                     variable=self.var_auto, bg=BG2, fg=FG,
+                                     selectcolor=BG3, activebackground=BG2,
+                                     activeforeground=FG,
+                                     font=("Microsoft YaHei UI", 9),
+                                     highlightthickness=0, bd=0),
+            "失败后用镜像重算偏移再试",
+            when="换过固件的机器，默认开着").pack(side="left", padx=(0, 18))
 
         self.var_sysadmin = tk.BooleanVar(value=False)
-        tk.Checkbutton(opt, text="要求 CAP_SYS_ADMIN", variable=self.var_sysadmin,
-                       bg=BG2, fg=FG, selectcolor=BG3, activebackground=BG2,
-                       activeforeground=FG, font=("Microsoft YaHei UI", 9),
-                       highlightthickness=0, bd=0).pack(side="left")
+        self._opt_group(
+            opt,
+            lambda b: tk.Checkbutton(b, text="要求 CAP_SYS_ADMIN",
+                                     variable=self.var_sysadmin, bg=BG2, fg=FG,
+                                     selectcolor=BG3, activebackground=BG2,
+                                     activeforeground=FG,
+                                     font=("Microsoft YaHei UI", 9),
+                                     highlightthickness=0, bd=0),
+            "只收带 mount 能力的 root",
+            when="要改只读分区才勾，乱勾会误判失败"
+            ).pack(side="left", padx=(0, 18))
 
-        # pack 顺序即从右往左：先放最右的输入框，再放它左边的标签
-        self.ent_port = tk.Entry(opt, width=6, bg=BG3, fg=FG, insertbackground=FG,
-                                 relief="flat", font=("Consolas", 10))
-        self.ent_port.insert(0, str(self.port))
-        self.ent_port.pack(side="right")
-        tk.Label(opt, text="adb 端口", bg=BG2, fg=FG_DIM,
-                 font=("Microsoft YaHei UI", 9)).pack(side="right", padx=(0, 8))
+        def _mk_port(box):
+            f = tk.Frame(box, bg=BG2)
+            self.ent_port = tk.Entry(f, width=6, bg=BG3, fg=FG,
+                                     insertbackground=FG, relief="flat",
+                                     font=("Consolas", 10))
+            self.ent_port.insert(0, str(self.port))
+            self.ent_port.pack(side="left")
+            tk.Label(f, text="adb 端口", bg=BG2, fg=FG_DIM,
+                     font=("Microsoft YaHei UI", 9)).pack(side="left", padx=(6, 0))
+            return f
+
+        self._opt_group(opt, _mk_port, "默认 5555",
+                        when="无线调试换了端口才改").pack(side="left")
 
         # 第二行：Magisk 与修复模块
         opt2 = tk.Frame(act, bg=BG2)
@@ -1769,36 +1816,65 @@ class App:
         self.var_magisk = tk.BooleanVar(value=False)
         self.var_module = tk.BooleanVar(value=False)
 
-        self.chk_magisk = tk.Checkbutton(
-            opt2, text="安装 Magisk（patch boot + 装 App，会重启一次）",
-            variable=self.var_magisk, command=self._on_magisk_toggle,
-            bg=BG2, fg=FG, selectcolor=BG3, activebackground=BG2, activeforeground=FG,
-            font=("Microsoft YaHei UI", 9), highlightthickness=0, bd=0)
-        self.chk_magisk.pack(side="left")
+        def _mk_magisk(box):
+            self.chk_magisk = tk.Checkbutton(
+                box, text="安装 Magisk（patch boot + 装 App，会重启一次）",
+                variable=self.var_magisk, command=self._on_magisk_toggle,
+                bg=BG2, fg=FG, selectcolor=BG3, activebackground=BG2,
+                activeforeground=FG, font=("Microsoft YaHei UI", 9),
+                highlightthickness=0, bd=0)
+            return self.chk_magisk
 
-        self.chk_module = tk.Checkbutton(
-            opt2, text="装 AMS 修复模块（修 Magisk App 卡在启动图）",
-            variable=self.var_module,
-            bg=BG2, fg=FG, selectcolor=BG3, activebackground=BG2, activeforeground=FG,
-            font=("Microsoft YaHei UI", 9), highlightthickness=0, bd=0)
-        self.chk_module.pack(side="left", padx=(18, 0))
+        self._opt_group(opt2, _mk_magisk, "写 boot 分区把 root 固化",
+                        when="要重启后还有 root").pack(side="left", padx=(0, 18))
+
+        def _mk_module(box):
+            self.chk_module = tk.Checkbutton(
+                box, text="装 AMS 修复模块（修 Magisk App 卡在启动图）",
+                variable=self.var_module,
+                bg=BG2, fg=FG, selectcolor=BG3, activebackground=BG2,
+                activeforeground=FG, font=("Microsoft YaHei UI", 9),
+                highlightthickness=0, bd=0)
+            return self.chk_module
+
+        self._opt_group(opt2, _mk_module, "补 services.jar 的 AMS NPE",
+                        when="Magisk App 点开闪退时"
+                        ).pack(side="left", padx=(0, 18))
 
         # 自动适配时能不能走 9008。开着是默认：没 root 时这是唯一能拿到
         # boot 分区内容的路。关掉就只有「已 root 的机器能自动适配」。
         self.var_edl = tk.BooleanVar(value=True)
-        tk.Checkbutton(
-            opt2, text="允许 9008(EDL) 读分区", variable=self.var_edl,
-            bg=BG2, fg=FG, selectcolor=BG3, activebackground=BG2,
-            activeforeground=FG, font=("Microsoft YaHei UI", 9),
-            highlightthickness=0, bd=0).pack(side="left", padx=(18, 0))
+
+        def _mk_edl(box):
+            return tk.Checkbutton(
+                box, text="允许 9008(EDL) 读分区", variable=self.var_edl,
+                bg=BG2, fg=FG, selectcolor=BG3, activebackground=BG2,
+                activeforeground=FG, font=("Microsoft YaHei UI", 9),
+                highlightthickness=0, bd=0)
+
+        self._opt_group(opt2, _mk_edl, "用 9008 模式直读分区",
+                        when="机器没 root、又要自动适配").pack(side="left")
 
         # 第三行：换内核后的适配入口。不参与 root 流程，单独开窗
         opt3 = tk.Frame(act, bg=BG2)
         opt3.pack(fill="x", padx=10, pady=(0, 10))
         tk.Label(opt3, text="换了固件 / 内核？", bg=BG2, fg=FG_DIM,
-                 font=("Microsoft YaHei UI", 9)).pack(side="left")
-        self.btn_adapter = self._btn(opt3, "内核适配向导", self.open_adapter, w=14)
-        self.btn_adapter.pack(side="left", padx=6)
+                 font=("Microsoft YaHei UI", 9)).pack(side="left", anchor="n")
+        g, self.btn_adapter, _ = self._btn_group(
+            opt3, "内核适配向导", self.open_adapter,
+            "重算 62 个偏移并编 so", when="OTA 或换 ROM 后", w=14)
+        g.pack(side="left", padx=6)
+
+        # ONYX 的 abl 把 fastboot 的 flash 子命令裁掉了（实测 remote:
+        # 'unknown command'），所以「刷 boot」根本走不通 fastboot。9008 是
+        # SoC 自己的下载模式，跟 fastboot 是两套通道，厂商裁不掉它 ——
+        # 这是没有 root 时唯一还能写 boot 的路。
+        g, self.btn_edlflash, _ = self._btn_group(
+            opt3, "EDL 刷 boot", self.start_edl_flash,
+            "9008 直写分区",
+            when="fastboot 刷不进去时", w=14)
+        g.pack(side="left", padx=6)
+
         self.lbl_targets = tk.Label(opt3, text="", bg=BG2, fg=FG_DIM,
                                     font=("Microsoft YaHei UI", 8))
         self.lbl_targets.pack(side="left", padx=6)
@@ -1806,27 +1882,41 @@ class App:
         # 机型闸门的手动放行开关。默认不勾 —— 型号/内核对不上时一键全自动
         # 会停在检测之后，一步都不往设备写。勾了才继续，用 warn 色标出来。
         self.var_force = tk.BooleanVar(value=False)
-        tk.Checkbutton(
-            opt3, text="跳过型号核对（偏移不对会 panic）", variable=self.var_force,
-            bg=BG2, fg=WARN_C, selectcolor=BG3, activebackground=BG2,
-            activeforeground=WARN_C, font=("Microsoft YaHei UI", 9),
-            highlightthickness=0, bd=0).pack(side="right")
+
+        def _mk_force(box):
+            return tk.Checkbutton(
+                box, text="跳过型号核对（偏移不对会 panic）", variable=self.var_force,
+                bg=BG2, fg=WARN_C, selectcolor=BG3, activebackground=BG2,
+                activeforeground=WARN_C, font=("Microsoft YaHei UI", 9),
+                highlightthickness=0, bd=0)
+
+        self._opt_group(opt3, _mk_force,
+                        "型号/内核对不上也照跑",
+                        when="确认是同一颗内核、只是字符串不同时报",
+                        wrap=240).pack(side="right")
 
         # 第四行：Google Play。和 root 完全独立的一条腿 ——
         # 装商店不需要先 root，root 过的机器也不需要再走一遍。
         # 只有集成版才画这一行：普通版没有内置 APK，留个按钮只会点了报错。
         self.btn_gplay = None
         self.lbl_gplay = None
+        self.lbl_gplay_hint = None
         if GP_ENABLED:
             opt4 = tk.Frame(act, bg=BG2)
             opt4.pack(fill="x", padx=10, pady=(0, 10))
             tk.Label(opt4, text="谷歌服务？", bg=BG2, fg=FG_DIM,
-                     font=("Microsoft YaHei UI", 9)).pack(side="left")
-            self.btn_gplay = self._btn(opt4, "装 Google Play", self.start_gplay, w=14)
-            self.btn_gplay.pack(side="left", padx=6)
+                     font=("Microsoft YaHei UI", 9)).pack(side="left", anchor="n")
+            # 前置条件写在按钮正下方，不塞进点击后的弹窗里 —— ONYX 在 framework
+            # 层按 MMKV 的 gms_enable 拦商店，那个值只在账号验证通过时由系统自己写。
+            # 不登录就永远停在"被拦"，先看到这句可以省一整轮试错。
+            g, self.btn_gplay, self.lbl_gplay_hint = self._btn_group(
+                opt4, "装 Google Play", self.start_gplay,
+                "需先在设备设置里登录 Google 账号并验证通过",
+                when="商店打不开时", box_w=190, w=14)
+            g.pack(side="left", padx=6)
             self.lbl_gplay = tk.Label(opt4, text="", bg=BG2, fg=FG_DIM,
                                       font=("Microsoft YaHei UI", 8))
-            self.lbl_gplay.pack(side="left", padx=6)
+            self.lbl_gplay.pack(side="left", padx=6, anchor="n")
 
         # 进度条。日志区是 expand=True 的，不给进度条固定高度就会被挤成一条线
         pf = tk.Frame(self.root, bg=BG, height=12)
@@ -1871,6 +1961,55 @@ class App:
                       relief="flat", bd=0, width=w, height=1,
                       font=("Microsoft YaHei UI", 9), cursor="hand2")
         return b
+
+    def _btn_group(self, parent, text, cmd, hint, when="", box_w=136, box_h=92, **kw):
+        """按钮 + 两行小字说明，返回 (容器, 按钮, 说明标签)。
+
+        第一行「点下去发生什么」，第二行「什么情况下该点」。
+        只写第一行等于把判断留给用户 —— 八个按钮摆一排时，人缺的不是
+        功能名，是「我现在这个状态该按哪个」。
+
+        容器尺寸写死（box_w × box_h）并且关掉 pack_propagate：按钮文案长短不一，
+        让容器自己收缩的话每组宽度都不同，下面那行说明的居中基准就跟着乱，
+        看上去像错位。固定尺寸后整行是等宽的格子。
+        """
+        box = tk.Frame(parent, bg=BG2, width=box_w, height=box_h)
+        box.pack_propagate(False)
+        b = self._btn(box, text, cmd, **kw)
+        b.pack(side="top", fill="x")
+        lbl = tk.Label(box, text=hint, bg=BG2, fg=FG_DIM,
+                       font=("Microsoft YaHei UI", 8),
+                       wraplength=box_w - 6, justify="center", anchor="n")
+        lbl.pack(side="top", fill="x", pady=(3, 0))
+        # 第二行再压一档灰并加「用在」前缀：两行同样亮度会糊成一整段，
+        # 用户读不出哪句是行为、哪句是触发条件。
+        tk.Label(box, text="用在·" + when, bg=BG2, fg="#7d7d7d",
+                 font=("Microsoft YaHei UI", 7),
+                 wraplength=box_w - 6, justify="center", anchor="n").pack(
+            side="top", fill="x", pady=(2, 0))
+        return box, b, lbl
+
+    def _opt_group(self, parent, make, hint, when="", wrap=210):
+        """选项（勾选框 / 输入框）+ 两行小字说明，返回容器。
+
+        选项比按钮更需要交代条件：「要求 CAP_SYS_ADMIN」勾上会把成功率
+        从「基本一轮成」压到「可能三轮都不中」，不写清楚就是让人瞎勾。
+
+        make 是工厂（lambda box: widget），不是现成控件 —— 控件必须在组容器
+        建好之后再建，否则改不了父子关系（Tk 的 master 建完就定）。
+        """
+        box = tk.Frame(parent, bg=BG2)
+        w = make(box)
+        w.pack(side="top", anchor="w")
+        tk.Label(box, text=hint, bg=BG2, fg=FG_DIM,
+                 font=("Microsoft YaHei UI", 8),
+                 wraplength=wrap, justify="left", anchor="w").pack(
+            side="top", anchor="w", pady=(2, 0))
+        tk.Label(box, text="用在·" + when, bg=BG2, fg="#7d7d7d",
+                 font=("Microsoft YaHei UI", 7),
+                 wraplength=wrap, justify="left", anchor="w").pack(
+            side="top", anchor="w")
+        return box
 
     # -- 日志 ----------------------------------------------------------------
 
@@ -1973,6 +2112,9 @@ class App:
         # 普通版没有这个按钮，属性是 None，塞进列表会炸
         if self.btn_gplay is not None:
             ws.append(self.btn_gplay)
+        # EDL 刷 boot 也要锁：跑到一半再点一次，等于两条 firehose 会话抢同一根线
+        if self.btn_edlflash is not None:
+            ws.append(self.btn_edlflash)
         for w in ws:
             w.configure(state=state)
         for w in (self.chk_magisk, self.chk_module):
@@ -2198,6 +2340,106 @@ class App:
             n = 3
         self._start_worker(do_detect=True, do_deploy=True, tries=n,
                            require_sysadmin=self.var_sysadmin.get())
+
+    # -- EDL 刷 boot ---------------------------------------------------------
+
+    def start_edl_flash(self):
+        """9008 直写 boot 分区。
+
+        为什么另开一条腿：ONYX 的 abl 把 fastboot 的 flash handler 裁掉了
+        （实测 remote: 'unknown command'），fastboot 刷 boot 在这几台机器上
+        根本不成立。9008 是高通 SoC 的 PBL/SBL 下载模式，走 Firehose 协议，
+        跟 fastboot 是两条互不相干的通道 —— 裁 fastboot 命令表裁不掉它。
+
+        路子的代价：设备要黑屏重启进下载模式，全程约 3-6 分钟（96MB 备份 +
+        写入 + 读回）。收益：不需要 root，也不需要 bootloader 已解锁。
+        """
+        try:
+            import edlman
+            import adapter
+        except Exception as e:
+            messagebox.showerror("EDL 不可用", "加载 edl 模块失败：\n%s" % e)
+            return
+
+        path = filedialog.askopenfilename(
+            title="选择要写入的 boot 镜像（Magisk 打过补丁的）",
+            initialdir=self._gp_base(),
+            filetypes=[("boot 镜像", "*.img"), ("全部", "*.*")])
+        if not path:
+            return
+
+        # 本地先验头部。不是 ANDROID! 就没必要让设备黑屏重启一趟 ——
+        # 而且 recovery / vendor_boot 写进 boot 分区是直接开不了机。
+        try:
+            hdr = adapter.parse_boot_hdr(path)
+        except Exception as e:
+            messagebox.showerror("镜像不对", str(e))
+            return
+        if not hdr:
+            messagebox.showerror(
+                "镜像不对",
+                "读不到 ANDROID! 头。\n\n"
+                "recovery / vendor_boot / 普通文件写进 boot 分区会开不了机。")
+            return
+
+        size = os.path.getsize(path)
+        try:
+            slot = edlman.slot_suffix() or "_b"
+        except Exception:
+            slot = "_b"
+        part = "boot" + slot
+        try:
+            digest = edlman.sha256_of(path)
+        except Exception:
+            digest = "（算不出来）"
+
+        if not messagebox.askyesno(
+                "确认用 9008 写 boot",
+                "目标分区：%s（当前运行槽 %s）\n"
+                "镜像：%s\n"
+                "大小：%.1f MB\n"
+                "sha256：%s\n\n"
+                "顺序：备份原分区 → 写入 → 读回比对 sha256（不符自动回滚）\n"
+                "期间设备会黑屏并重启（进 9008 下载模式），完成后自动回系统。\n\n"
+                "继续？"
+                % (part, slot, os.path.basename(path), size / 1048576.0, digest)):
+            return
+
+        self._busy(True)
+        self.q.put(("log", "== EDL 刷 boot =="))
+        self.q.put(("log", "  分区 %s  镜像 %s（%.1f MB）"
+                           % (part, os.path.basename(path), size / 1048576.0)))
+
+        def qlog(s=""):
+            # edl 的输出在后台线程里产生，直接写 Text 会撞 Tk 的单线程约束
+            self.q.put(("log", str(s)))
+
+        def job():
+            try:
+                r = edlman.write_partition(None, part, path, log=qlog)
+            except Exception as e:
+                msg = str(e)
+                self.q.put(("log", "[错误] EDL 刷 boot 失败：%s" % msg))
+                self.root.after(0, lambda m=msg: (
+                    self._busy(False),
+                    messagebox.showerror("EDL 刷 boot 失败", m)))
+                return
+            self.q.put(("log", "  写入完成：%s（%d 字节）"
+                               % (r["partition"], r["size"])))
+            if r["backup"]:
+                self.q.put(("log", "  原分区备份：%s" % r["backup"]))
+            if r["verified"]:
+                self.q.put(("log", "  读回校验通过（sha256 与源文件一致）"))
+            self.root.after(0, lambda: (
+                self._busy(False),
+                messagebox.showinfo(
+                    "EDL 刷 boot 完成",
+                    "已写入 %s，读回 sha256 与源文件一致。\n\n"
+                    "设备会自己重启。开机后如果没看到 Magisk，先确认 App "
+                    "已装好，再查这份镜像本身是否真的打过补丁。"
+                    % r["partition"])))
+
+        threading.Thread(target=job, daemon=True).start()
 
     # -- Google Play ---------------------------------------------------------
 
@@ -2461,9 +2703,11 @@ def main():
     ap.add_argument("--no-edl", action="store_true",
                     help="自动适配时禁止走 9008（设备会黑屏重启）")
     ap.add_argument("--edl", nargs="?", const="env", default=None,
-                    metavar="env|slot|gpt|dump",
-                    help="EDL 链路自检与单独操作：env(默认)/slot/gpt/dump，"
-                         "全程只读，不改设备")
+                    metavar="env|slot|gpt|dump|r|w",
+                    help="EDL 链路自检与单独操作：env(默认)/slot/gpt/dump/r 只读；"
+                         "w 是写分区（先备份、写完读回校验、不符自动回滚），"
+                         "w 必须带 --yes，否则只打印计划。"
+                         "例：--edl w boot_b patched.img --yes")
     ap.add_argument("--serial", default=None, help="指定设备序列号")
     ap.add_argument("--force-model", action="store_true",
                     help="型号或内核与本工具适配的不一致时仍然继续。"
@@ -2481,8 +2725,8 @@ def main():
         ap.error("unrecognized arguments: %s" % " ".join(extra))
 
     if args.edl:
-        # EDL 单独跑：验证内置 edlclient 在冻结环境里能不能加载、能不能读分区。
-        # 只读，不写设备任何字节。
+        # EDL 单独跑：env/slot/gpt/dump/r 只读；w 会写分区（自带备份 + 读回校验）。
+        # w 不带 --yes 时 edlman 只打印计划就返回，这里不需要再拦一层。
         attach_console()
         logp, logf = _edl_log_open()
         # 主输出必须是日志文件，不能是控制台。

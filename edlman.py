@@ -276,27 +276,13 @@ def _fix_driver(log=None):
 # ----------------------------------------------------------------------
 # GPT 解析
 # ----------------------------------------------------------------------
-# edl 的实际输出（edlclient/Library/gpt.py:418）：
-#   "boot_b:              Offset 0x0000000040000000, Length 0x0000000004000000, ..., Active True"
-# 分区名右补空格到 20 列、名字后带冒号。冒号做可选，防不同版本格式差异。
-GPT_RE = re.compile(
-    r"^\s*([^\s:]+):?\s+Offset\s+(0x[0-9a-fA-F]+),"
-    r"\s+Length\s+(0x[0-9a-fA-F]+)"
-    r"(?:.*?Active\s+(True|False))?", re.M)
-
-
-def parse_gpt(text):
-    parts = {}
-    for m in GPT_RE.finditer(text or ""):
-        name = m.group(1)
-        if name in ("GPT", "Parsing", "Table"):
-            continue
-        parts[name] = dict(
-            offset=int(m.group(2), 16),
-            length=int(m.group(3), 16),
-            active=(m.group(4) == "True") if m.group(4) else None,
-        )
-    return parts
+# 解析函数在 edllink 里（写分区前要用它核对「分区存在 + 装得下」，而
+# edllink 不能被这边反向 import，那边也不能 import edlman）。
+# 这里保留同名绑定，外部调用点和已有测试不用改。
+# edl 的实际输出形如：
+#   "boot_b:  Offset 0x0000000040000000, Length 0x0000000004000000, Active True"
+GPT_RE = edllink.GPT_RE
+parse_gpt = edllink.parse_gpt
 
 
 # ----------------------------------------------------------------------
@@ -385,6 +371,158 @@ def read_partition(loader, name, out_path, log=None, timeout=300):
     if not os.path.isfile(out_path) or os.path.getsize(out_path) == 0:
         raise EdlError("读 %s 失败（文件没生成）" % name)
     return os.path.getsize(out_path)
+
+
+def write_partition(loader, name, image, bak_dir=None, log=None,
+                    allow_driver=True, backup=True, verify=True,
+                    timeout_write=1800, timeout_read=900, reset_after=True):
+    """
+    把镜像写进分区。写前备份、写后读回校验，任一步对不上就回滚。
+
+    这是 fastboot 被厂商裁掉之后唯一「不需要 root 也能写 boot」的路：
+    abl 里没有 flash handler，但 9008 是 SoC 内置的 PBL/SBL 下载模式，
+    走的是高通自己的 Firehose 协议，跟 fastboot 是两套完全无关的通道，
+    厂商裁 fastboot 命令表裁不掉它。
+
+    顺序（每一步不成立都立刻停，分区一个字节不动）：
+      1. 分区必须在 GPT 里，容量必须装得下镜像
+      2. **先读一份原分区到 PC**，算 sha256 —— 这是回滚的唯一依据
+      3. 写
+      4. 读回镜像长度那一段，sha256 与源文件逐字节比对
+      5. 步骤 4 不符 → 用步骤 2 的备份写回去，然后抛异常
+      6. reset 让设备离开下载模式
+
+    为什么读回只读镜像长度那一段，不读整个分区：
+    boot_b 96MB 读一遍约 90 秒，写一遍约 60 秒。读回的目的只是证明
+    「写进去的字节等于源文件」，分区尾部那截本来就不该动，读它没有意义。
+
+    返回 dict(partition, size, backup, readback, sha256, verified, rolled_back)。
+    """
+    def say(x):
+        if log:
+            log(x)
+
+    image = os.path.abspath(image)
+    if not os.path.isfile(image):
+        raise EdlError("镜像不存在：%s" % image)
+    size = os.path.getsize(image)
+    if size <= 0:
+        raise EdlError("镜像是空文件：%s" % image)
+
+    if not _ensure_edl(log=log, allow_driver=allow_driver):
+        raise EdlError("设备没能进入可用的 9008 状态（写 boot 需要它）")
+
+    out_dir = os.path.abspath(bak_dir or os.path.join(_tool_root(), "work"))
+    os.makedirs(out_dir, exist_ok=True)
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+
+    src_sum = sha256_of(image)
+    say("  源镜像 %s  %d 字节" % (os.path.basename(image), size))
+    say("  sha256   %s" % src_sum)
+
+    sess = edllink.Session(loader=loader or find_loader())
+    bak_path = None
+    readback = None
+    rolled = False
+    try:
+        sess.open(timeout=90)
+        # 1) 分区表：存在性 + 容量 + 起始扇区
+        buf = []
+        sess.printgpt(on_line=buf.append, timeout=90)
+        gpt = parse_gpt("\n".join(buf))
+        e = gpt.get(name)
+        if not e:
+            key = name.lower().rstrip("_ab")
+            near = [n for n in gpt if n.lower().startswith(key[:5])][:8]
+            raise EdlError(
+                "分区表里没有 %s。%s"
+                % (name,
+                   ("相近的：" + "、".join(near)) if near
+                   else "分区表共读到 %d 项" % len(gpt)))
+        ss = int(sess.fh.firehose.cfg.SECTOR_SIZE_IN_BYTES) or 512
+        need_sec = (size + ss - 1) // ss
+        room_sec = e["length"] // ss
+        if need_sec > room_sec:
+            raise EdlError(
+                "镜像 %d 字节（%d 扇区）大于分区 %d 字节（%d 扇区）；已中止，未写入"
+                % (size, need_sec, e["length"], room_sec))
+        say("  分区 %s：offset 0x%X，%d 字节（镜像占 %d 扇区 / 共 %d 扇区）"
+            % (name, e["offset"], e["length"], need_sec, room_sec))
+
+        # 2) 备份原分区。读不满就是备份不可信 —— 这时绝不能往下写，
+        #    否则出事没有回滚依据。
+        if backup:
+            bak_path = os.path.join(out_dir, "stock_%s_%s.img" % (name, stamp))
+            say("  备份原分区 → %s" % bak_path)
+            sess.read(name, bak_path,
+                      on_line=(lambda t: say("  " + t)) if log else None,
+                      place=(0, e["offset"] // ss, e["length"] // ss),
+                      expect=e["length"], timeout=timeout_read)
+            got = os.path.getsize(bak_path)
+            if got != e["length"]:
+                raise EdlError("备份长度不对：%d != %d，已中止（分区未改动）"
+                               % (got, e["length"]))
+            say("  备份完成 %d 字节  sha256 %s"
+                % (got, sha256_of(bak_path)))
+
+        # 3) 写
+        say("  写入 %s …" % name)
+        info = sess.write(name, image,
+                          on_line=(lambda t: say("  " + t)) if log else None,
+                          timeout=timeout_write)
+        say("  写入完成，用时 %.1fs" % info["seconds"])
+
+        # 4) 读回校验（只读镜像长度那一段）
+        verified = None
+        if verify:
+            readback = os.path.join(out_dir, "readback_%s_%s.img" % (name, stamp))
+            say("  读回校验 …")
+            sess.read(name, readback,
+                      on_line=(lambda t: say("  " + t)) if log else None,
+                      place=(0, e["offset"] // ss, need_sec),
+                      expect=need_sec * ss, timeout=timeout_read)
+            back_sum = _sha256_prefix(readback, size)
+            verified = (back_sum == src_sum)
+            if not verified:
+                say("  [!] 读回 sha256 不符：%s != %s" % (back_sum, src_sum))
+                if bak_path:
+                    say("  [!] 用备份回写 …")
+                    sess.write(name, bak_path, timeout=timeout_write)
+                    rolled = True
+                    raise EdlError(
+                        "写入后读回校验不符，已用备份回写（回滚完成）。"
+                        "常见原因：USB 线/口不稳、programmer 与颗粒不匹配")
+                raise EdlError(
+                    "写入后读回校验不符，且没有备份可回滚 —— 设备可能起不来，"
+                    "需要重新进 9008 刷原厂固件")
+            say("  读回校验通过 %s" % src_sum)
+
+        return dict(partition=name, size=size, backup=bak_path or "",
+                    readback=readback or "", sha256=src_sum,
+                    verified=verified, rolled_back=rolled)
+    finally:
+        if reset_after:
+            try:
+                sess.reset()
+            except Exception:
+                pass
+        sess.close()
+
+
+def _sha256_prefix(path, n, chunk=1048576):
+    """只算文件前 n 字节的 sha256 —— 读回的文件是整扇区对齐的，比源镜像长一点。"""
+    h = hashlib.sha256()
+    left = n
+    with open(path, "rb") as f:
+        while left > 0:
+            b = f.read(min(chunk, left))
+            if not b:
+                break
+            h.update(b)
+            left -= len(b)
+    if left:
+        raise EdlError("读回文件只有 %d 字节，少了 %d" % (n - left, left))
+    return h.hexdigest()
 
 
 def reset(loader=None, log=None):
@@ -592,7 +730,8 @@ def sha256_of(path, chunk=1048576):
 def _cli():
     import argparse
     ap = argparse.ArgumentParser(
-        description="EDL 只读分区导出（不需要 root、不需要固件包）")
+        description="EDL 9008 分区读写（不需要 root、不需要固件包；"
+                    "写 boot 是 fastboot 被厂商裁掉之后的替代通道）")
     sub = ap.add_subparsers(dest="cmd")
 
     sub.add_parser("env", help="检查 programmer / libusb / 9008 状态")
@@ -608,6 +747,20 @@ def _cli():
     a5 = sub.add_parser("r", help="读任意分区")
     a5.add_argument("part")
     a5.add_argument("-o", "--out", required=True)
+    # 主程序会在透传参数末尾追加 --serial。EDL 走 USB 直连不看 adb serial，
+    # 但 parser 不认这个参数就会 rc=2 直接拒 —— 接收后忽略。
+    a5.add_argument("--serial", default=None, help="忽略（EDL 不看 adb serial）")
+    a6 = sub.add_parser("w", help="写任意分区（先备份、写完读回校验，不符自动回滚）")
+    a6.add_argument("part", help="分区名，如 boot_b")
+    a6.add_argument("image", help="要写入的镜像")
+    a6.add_argument("-o", "--out", default=None, help="备份目录（默认 <工具目录>/work）")
+    a6.add_argument("--no-backup", action="store_true",
+                    help="不备份原分区（出事无法回滚，不建议）")
+    a6.add_argument("--no-verify", action="store_true", help="写完不读回校验")
+    a6.add_argument("--yes", action="store_true",
+                    help="确认执行（不给就只打印计划，一个字节不写）")
+    a6.add_argument("--no-driver", action="store_true", help="缺驱动时不自动装")
+    a6.add_argument("--serial", default=None, help="忽略（EDL 不看 adb serial）")
     sub.add_parser("reset", help="退出下载模式")
 
     a = ap.parse_args()
@@ -646,6 +799,33 @@ def _cli():
         elif a.cmd == "r":
             n = read_partition(find_loader(), a.part, a.out, log=print)
             print("读出 %d 字节 → %s" % (n, a.out))
+        elif a.cmd == "w":
+            src = os.path.abspath(a.image)
+            if not os.path.isfile(src):
+                print("[X] 镜像不存在：%s" % src)
+                return 2
+            size = os.path.getsize(src)
+            print("准备写入")
+            print("  分区  : %s" % a.part)
+            print("  镜像  : %s（%d 字节）" % (src, size))
+            print("  sha256: %s" % sha256_of(src))
+            print("  备份  : %s" % ("不备份" if a.no_backup
+                                     else (a.out or os.path.join(_tool_root(), "work"))))
+            print("  校验  : %s" % ("跳过" if a.no_verify else "写完读回比对 sha256"))
+            if not a.yes:
+                print("\n未执行。确认无误后加 --yes 重跑本命令。")
+                return 0
+            r = write_partition(find_loader(), a.part, src, bak_dir=a.out,
+                                log=print, backup=not a.no_backup,
+                                verify=not a.no_verify,
+                                allow_driver=not a.no_driver)
+            print("\n写入 %s 完成：%d 字节" % (r["partition"], r["size"]))
+            if r["backup"]:
+                print("  原分区备份：%s" % r["backup"])
+            if r["verified"] is not None:
+                print("  读回校验  ：%s" % ("通过" if r["verified"] else "失败"))
+            if r["rolled_back"]:
+                print("  已回滚    ：是")
         elif a.cmd == "reset":
             reset(find_loader(), log=print)
         else:
