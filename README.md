@@ -238,6 +238,12 @@ unzip -o update.zip payload.bin payload_properties.txt
 payload-dumper-go -p boot payload.bin     # 或 cyxx/extract_android_ota_payload
 ```
 
+同一个 zip 也可以直接喂给本工具，不用装 `payload-dumper-go`：
+
+```bash
+Leaf5RootTool.exe --payload update.zip
+```
+
 注意：`payload.bin` 里是 `boot` 分区本体，A/B 机器刷回时按当前槽写
 （`boot_a` 或 `boot_b`），别两个槽都写。
 
@@ -584,9 +590,9 @@ python build.py --apk X.apk  # 指定打进带版里的包
 
 ---
 
-## 三个选项
+## 四个选项
 
-界面上是三级递进，可以单独勾：
+前三项在同一个框里，三级递进，可以单独勾；第四项是独立一行，用来手动刷 boot：
 
 **1. 一键 Root（必做）**
 
@@ -617,16 +623,25 @@ exploit 拿到 root 后，热装 Magisk：
 写回用 `dd` 而不是 fastboot：ONYX 的 abl 把 flash 命令裁了，`fastboot flash boot_b`
 一律返回 `remote: 'unknown command'`。
 
-**没有 root 时怎么刷 boot —— 走 9008**
+**没有 root 时怎么刷 boot —— fastbootd 或 9008**
 
-`dd` 要 su，fastboot 又被裁了，所以「没 root 又要写 boot」只剩 9008 这一条。它跟
-fastboot 是两条互不相干的通道：fastboot 跑在 abl（厂商可改、可裁）里，9008 是 SoC
-自己的 PBL/SBL 下载模式，走高通 Firehose 协议，裁 fastboot 命令表裁不掉它。
+`dd` 要 su，bootloader 的 `fastboot flash` 又被裁了，所以「没 root 又要写 boot」
+有两条路，界面第四行各有一个按钮：
+
+- **`fastbootd 刷 boot`**（首选）：`fastboot reboot fastboot` 拉起的是跑在 Android 里的
+  userspace 守护进程，写入走它自己的 `write(blockdev)`，**不经过 abl 的命令分发表**。
+  裁 flash 不会连带裁掉拉起它的那条 handler。10~30 秒，屏幕上有提示，不黑屏。
+- **`EDL 刷 boot`**（兜底）：9008 是 SoC 自己的 PBL/SBL 下载模式，走高通 Firehose 协议，
+  跟 fastboot 是两条互不相干的通道，裁 fastboot 命令表裁不掉它。设备会黑屏重启。
+
+fastbootd 判定的唯一依据是 `fastboot getvar is-userspace` 回 `yes`（bootloader 模式回 `no`），
+product 名两边会重样，不能拿来判。写之前先 `fastboot getvar partition-size:<分区>`
+比容量，装不下就不发写命令。失败时自动刷回刚才备份的那份。
 
 界面：`换了固件 / 内核？` 那一行的 **EDL 刷 boot**。先本地验 `ANDROID!` 头，再确认
 分区（按 `ro.boot.slot_suffix` 走 `boot_b` / `boot_a`），然后设备黑屏重启进 9008。
 
-顺序固定，每步不成立就停、分区一个字节不动：
+9008 的顺序固定，每步不成立就停、分区一个字节不动：
 
 ```
 1. 分区必须在 GPT 里，容量必须装得下镜像
@@ -691,6 +706,40 @@ classes.dex 0x2b2fee : 38 01 33 00  →  38 01 3F 00
 
 模块在 Magisk 里长什么样、怎么验证生效、怎么停用，见下面「Magisk 里的 Leaf5 模块」。
 
+**4. 要刷 boot？（独立一行，两个按钮）**
+
+一键全自动里刷 boot 是 Magisk 流程的一步；手动刷（自己打好补丁的 img、或者从坏的
+状态刷回原厂）走这一行。
+
+**取原厂 boot**
+
+刷 boot 得先有 boot 镜像。手上没镜像、或者刷坏了要留原厂底片，点这个选官方
+`update.zip`（ONYX 官网那个 1.74 GiB 的整包），工具从里面的 `payload.bin` 直接抽出
+`boot` / `init_boot`，写到 `%LOCALAPPDATA%\Leaf5RootTool\backup\boot_stock.img`。
+**不需要设备、不需要 root**，纯本地解包。
+
+- `payload.bin` 是 chromiumos 的 `update_metadata.proto`：`CrAU` + 版本 + manifest 长度
+  + manifest + 签名 + blobs。工具手解 protobuf 三层，只取要的那一个分区。
+- **不整个解压**。`payload.bin` 在 zip 里是 STORED，按 zip local header 算出的绝对偏移
+  直接切片读，1.8 GB 的包只读用到的那几 MB。
+- **`init_boot` 优先**。Android 13 起 ramdisk 从 `boot` 搬到 `init_boot`，两个都在时
+  必须打 `init_boot`；打 `boot` 会得到没有 ramdisk 的镜像，刷上去不进系统。
+- **`.upx` 不能直接读**。那是 ONYX 自己的加密容器（随机字节开头、无魔数），
+  先解成 `update.zip` 再喂进来。
+- 增量操作（`MOVE` / `BSDIFF` / `SOURCE_COPY` / `PUFFDIFF` / `ZUCCHINI`）遇到就报错 ——
+  那是差分包才有的，full OTA 里出现说明包不对，猜着拼会拼出废镜像。
+
+四份实测（Leaf5 / Tab10 / Tab8C / Tab8）都能解：分区 13/12/12/12，`block_size=4096`，
+boot 都是 `100663296` 字节（96 MB），抽出来头 8 字节是 `ANDROID!`。
+
+**fastbootd 刷 boot**
+
+先本地验 `ANDROID!` 头，再按 `ro.boot.slot_suffix` 定分区（Leaf5 是 A/B，落到 `boot_b`），
+然后 `fastboot reboot fastboot` 进 fastbootd、比容量、写、重启回 Android。
+
+写失败会自动刷回进 fastbootd 之前备份的那份。进不去 fastbootd 时会明确说清原因，
+而不是留一句 `unknown command`。
+
 ---
 
 ## 命令行
@@ -704,6 +753,8 @@ Leaf5RootTool.exe --auto --magisk --no-edl  # 同上，但禁止进 9008
 Leaf5RootTool.exe --check                   # 只检测，不动设备
 Leaf5RootTool.exe --root 3                  # 只跑 3 轮，不做自动适配
 Leaf5RootTool.exe --auto --force-model      # 机型/内核不匹配也硬走（自己算过偏移时用）
+Leaf5RootTool.exe --payload update.zip      # 从官方 OTA 抽原厂 boot，不碰设备
+Leaf5RootTool.exe --payload                 # 自动找 EXE 同级 firmware\*.zip
 ```
 
 `--auto` 中间不会问你任何问题。它只在设备没连、机型/内核对不上、镜像自证不上、
@@ -717,6 +768,7 @@ Leaf5RootTool.exe --root 3            无界面跑 3 轮
 Leaf5RootTool.exe --root 5 --sysadmin 要求 CAP_SYS_ADMIN
 Leaf5RootTool.exe --root 3 --magisk   顺带装 Magisk
 Leaf5RootTool.exe --root 3 --module   只装 AMS 修复模块（Magisk 已装）
+Leaf5RootTool.exe --payload <zip>     从官方 OTA 抽原厂 boot.img（不需要设备）
 Leaf5RootTool.exe --force-model       型号/内核不匹配时仍然继续（偏移自己负责）
 Leaf5RootTool.exe --port 5053         指定 adb server 端口
 ```
@@ -844,6 +896,10 @@ adb shell su -c 'rm -rf /data/adb/modules/boox-ams-fix'
 - Magisk 默认策略会拒 shell 的 su 请求，第一次要在 App 的「超级用户」里把 Shell 打开
 - `/system` 是 dm-verity 保护的 dm-linear，SYS_ADMIN 也 remount 不动；`/data` 是 `nosuid`，
   `chmod 4755` 永远无效
+- **`fastbootd 刷 boot` 没在真机上落盘验证过**。`is-userspace` 判定、`partition-size`
+  取值、`flash` 的参数顺序都有单测（19 项，假的是 fastboot.exe 的命令行输出），
+  但 `reboot fastboot` 之后 ONYX 的 fastbootd 会不会因为 `ro.boot.flash.locked`
+  拒写，手上没空机器，未测。刷不进去就退 9008，那条路是实测过的
 
 ### 三条容易踩的坑（装之前先看）
 
@@ -868,7 +924,8 @@ adb shell getprop ro.boot.slot_suffix
 拿来当"恢复原厂"的基底会把你 Magisk 版本固定在这一版，拿来当"重装 Magisk
 的原料"也不对（Magisk 要在**未 patch** 的 boot 上打补丁，叠着打会出问题）。
 
-要原厂 boot，只能从 ONYX 官方固件包里取 `boot.img`。
+要原厂 boot，只能从 ONYX 官方固件包里取 `boot.img` —— 界面上「取原厂 boot」
+那个按钮（或 `--payload update.zip`）干的就是这件事。
 
 **3. bootloader 必须已解锁**
 
@@ -1167,6 +1224,8 @@ elfsyms.py              纯标准库 ELF64 符号表解析 + kallsyms 文本解�
 ndkman.py               NDK 查找 / 下载 / 解压 / 校验 / 裁剪
 drivers.py              Zadig 驱动引导（新机器缺 WinUSB 时）
 gp.py                   Google Play 的探测 / 安装 / 启用（独立模块，不依赖 RootWorker）
+payload.py              官方 OTA 的 payload.bin 解析与 boot 抽取（纯标准库，不碰设备）
+fbdlink.py              自带 fastboot 客户端 + fastbootd 通路（userspace 写入）
 build.py                打包脚本（同时出带包和不带包两个版本）
 
 edlmain.py              firehose 协议层（USB / 串口 / 网络三种后端）
@@ -1229,7 +1288,8 @@ python tools/fetch_deps.py --check   # 只看缺什么，不下载
 python tools/fetch_deps.py --no-zadig
 ```
 
-能自动下的有七件：adb 三件、Magisk、`lito_op_n10_fhprg.bin`、`lito_moto_fhprg.bin`、zadig。
+能自动下的有八件：adb 四件（含 `fastboot.exe`）、Magisk、`lito_op_n10_fhprg.bin`、
+`lito_moto_fhprg.bin`、zadig。
 下完立即校验，对不上就删掉报错 —— 不会留下一个"看着在、其实是 404 页面"的文件。
 `adb` 钉的是 platform-tools **r37.0.0**（`-latest` 会漂移，r37.0.1 的三个文件
 哈希与下面这组全都不同，实测过）。
@@ -1241,6 +1301,7 @@ python tools/fetch_deps.py --no-zadig
 | `assets/adb/adb.exe` | [platform-tools r37.0.0](https://dl.google.com/android/repository/platform-tools_r37.0.0-win.zip) | ✅ | `957e46b8615f7af5b7292a2ddabe98d2e61940c3fb2b0545756507f080613e71` |
 | `assets/adb/AdbWinApi.dll` | 同上（zip 里 `platform-tools/`） | ✅ | `120bef587119c6cb926b86b9be90fdfbce38937588eae28cd91a94ce63c7b965` |
 | `assets/adb/AdbWinUsbApi.dll` | 同上 | ✅ | `6ca69a2ca0e31309c087d288f058977d421ad03500e4c3e1dbd981241a069c60` |
+| `assets/adb/fastboot.exe` | 同上（zip 里 `platform-tools/`） | ✅ | `dd55fef77ab2753b6423f37f39d91cb00ce53ab4539a2431577f07c4abcaa32a` |
 | `assets/magisk/Magisk-v31.1.apk` | [Magisk v31.1](https://github.com/topjohnwu/Magisk/releases/download/v31.1/Magisk-v31.1.apk) | ✅ | `89cefac0a318afa39fb3880c45c87b036c05bc1ebf02a7a715b7f8d7c26ac6e7` |
 | `assets/zadig.exe` | [libwdi v1.5.1 → zadig-2.9.exe](https://github.com/pbatard/libwdi/releases/download/v1.5.1/zadig-2.9.exe) | ✅ 可选 | `4ecaa95df3da3621486a043aef8b3050b8bafe7c901402871e816229ef82039b` |
 | `assets/lito_op_n10_fhprg.bin` | [bkerler/Loaders → op_n10](https://raw.githubusercontent.com/bkerler/Loaders/main/oneplus/0013f0e100515198_2354228eebcbc203_fhprg_op_n10.bin) | ✅ | `6558f49c3a55d0eb7fdd7bb326c9bb22b29f4b6b6316937e847e8b76e11f6ec0` |

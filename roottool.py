@@ -53,7 +53,7 @@ except ImportError:  # 精简版 Python 可能没带 tcl/tk
 # ----------------------------------------------------------------------------
 
 APP_NAME = "Leaf5 Root Tool"
-APP_VER = "1.1.7"
+APP_VER = "1.1.8"
 
 # 本工具适配的唯一目标。写在界面上、写进日志、拿来卡住别的机型。
 # 62 个偏移 + services.jar 补丁点全部绑死在这个三元组上，换任何一个都不成立。
@@ -330,6 +330,19 @@ def install_adb(port=DEFAULT_PORT):
                 except OSError:
                     pass
     return os.path.join(bindir, "adb.exe")
+
+
+def fastboot_exe():
+    """内嵌 fastboot.exe 的路径。
+
+    不像 adb 那样铺到 %LOCALAPPDATA%：fastboot 是一次性命令，跑完就退，
+    不存在「EXE 退出后进程还在占文件」的问题，直接读包内那份即可。
+    PATH 里有就退回去用系统的。
+    """
+    p = resource_path("assets", "adb", "fastboot.exe")
+    if os.path.isfile(p):
+        return p
+    return shutil.which("fastboot.exe") or shutil.which("fastboot") or ""
 
 
 class Adb:
@@ -1680,7 +1693,15 @@ class App:
         # 普通版少了 Google Play 那一行，高度跟着收 28px，否则底部空一条
         # 每个按钮、每个选项下面都多了「用在什么情况」那一行，纵向比原来多约 160px。
         # 窗口跟着长高，否则日志区被压成一条缝 —— 日志是唯一的事后证据。
-        root.geometry("900x880" if GP_ENABLED else "900x850")
+        # 多了一行「要刷 boot？」（两个按钮 + 两行说明 ≈ 86px）。
+        # 屏幕不够就压回屏幕内 —— 否则底部日志区整个跑到屏幕外，用户看不到
+        # 任何一步的输出，而日志是本工具唯一的事后证据。
+        _h = 966 if GP_ENABLED else 936
+        try:
+            _h = min(_h, root.winfo_screenheight() - 60)
+        except Exception:
+            pass
+        root.geometry("900x%d" % _h)
         root.minsize(780, 580)
         root.configure(bg=BG)
 
@@ -1878,6 +1899,29 @@ class App:
         self.lbl_targets = tk.Label(opt3, text="", bg=BG2, fg=FG_DIM,
                                     font=("Microsoft YaHei UI", 8))
         self.lbl_targets.pack(side="left", padx=6)
+
+        # 第四行：镜像从哪来 + 另一条写入通路。
+        # 「取原厂 boot」解决的是「刷 boot 的镜像哪来」—— 自己 dd 备份的前提
+        # 是设备已经 root，没 root 的机器连块设备都读不了；官方 OTA 里的
+        # payload.bin 带着完整 boot，纯本地解包就能取出来。
+        # 「fastbootd 刷 boot」和 9008 是同一件事的两种走法：它快（10~30 秒）、
+        # 屏幕上有提示，但要设备能进 fastbootd；9008 是最后兜底。
+        opt_boot = tk.Frame(act, bg=BG2)
+        opt_boot.pack(fill="x", padx=10, pady=(0, 10))
+        tk.Label(opt_boot, text="要刷 boot？", bg=BG2, fg=FG_DIM,
+                 font=("Microsoft YaHei UI", 9)).pack(side="left", anchor="n")
+
+        g, self.btn_payload, _ = self._btn_group(
+            opt_boot, "取原厂 boot", self.start_payload,
+            "解 update.zip 抽 boot.img",
+            when="没镜像、或要留原厂底片", w=14)
+        g.pack(side="left", padx=(6, 6))
+
+        g, self.btn_fbdflash, _ = self._btn_group(
+            opt_boot, "fastbootd 刷 boot", self.start_fastbootd_flash,
+            "走 userspace 写入，不经 abl",
+            when="没 root、又不想黑屏进 9008", w=17)
+        g.pack(side="left", padx=6)
 
         # 机型闸门的手动放行开关。默认不勾 —— 型号/内核对不上时一键全自动
         # 会停在检测之后，一步都不往设备写。勾了才继续，用 warn 色标出来。
@@ -2112,9 +2156,14 @@ class App:
         # 普通版没有这个按钮，属性是 None，塞进列表会炸
         if self.btn_gplay is not None:
             ws.append(self.btn_gplay)
-        # EDL 刷 boot 也要锁：跑到一半再点一次，等于两条 firehose 会话抢同一根线
-        if self.btn_edlflash is not None:
-            ws.append(self.btn_edlflash)
+        # 这三条写入通路都要锁：跑到一半再点一次，等于两条会话抢同一根线。
+        # 用 getattr 而不是直接读属性 —— 属性是 _build 里赋的，构建中途
+        # 出过异常时它们根本不存在，那样写会在 _busy 里炸掉，把真正的
+        # 构建错误盖成一句 AttributeError。
+        for attr in ("btn_edlflash", "btn_fbdflash", "btn_payload"):
+            w = getattr(self, attr, None)
+            if w is not None:
+                ws.append(w)
         for w in ws:
             w.configure(state=state)
         for w in (self.chk_magisk, self.chk_module):
@@ -2342,6 +2391,187 @@ class App:
                            require_sysadmin=self.var_sysadmin.get())
 
     # -- EDL 刷 boot ---------------------------------------------------------
+
+    def start_payload(self):
+        """从官方 update.zip 里抽原厂 boot。
+
+        为什么需要这个入口：「刷 boot 的镜像从哪来」一直是个坑 —— 自己
+        dd 备份的前提是设备已经 root，没 root 的机器连块设备都读不了。
+        官方 OTA 的 payload.bin 带着每个分区的完整镜像，纯本地解包就能取；
+        这份原厂镜像既能交给 Magisk 打补丁，也能在刷坏时刷回来。
+
+        ONYX 下载下来的是 .upx（厂商加密容器），要先解成 update.zip 才能读。
+        """
+        try:
+            import payload as pl
+        except Exception as e:
+            messagebox.showerror("不可用", "加载 payload 模块失败：\n%s" % e)
+            return
+
+        fw = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), "firmware")
+        init = fw if os.path.isdir(fw) else os.getcwd()
+        path = filedialog.askopenfilename(
+            title="选择官方固件包 update.zip",
+            initialdir=init,
+            filetypes=[("OTA 包", "*.zip"), ("全部", "*.*")])
+        if not path:
+            return
+
+        out_dir = backup_dir()
+        self._busy(True)
+        self.q.put(("log", "== 取原厂 boot =="))
+        self.q.put(("log", "  固件包 %s" % os.path.basename(path)))
+
+        def job():
+            p = None
+            try:
+                p = pl.Payload(path)
+                self.q.put(("log", "  payload v%d，%d 个分区"
+                                   % (p.version, len(p.manifest.partitions))))
+                for part in p.manifest.partitions:
+                    self.q.put(("log", "    " + part.describe()))
+                boot = p.find_boot()
+                if boot is None:
+                    raise pl.PayloadError("包里既没有 boot 也没有 init_boot")
+                self.q.put(("log", "  打补丁目标：%s（%.1f MB），解包中…"
+                                   % (boot.name, boot.size / 1048576.0)))
+                info = p.extract_boot(out_dir)
+            except pl.PayloadError as e:
+                msg = e.render()
+                self.q.put(("log", "[错误] %s" % msg))
+                self.root.after(0, lambda m=msg: (
+                    self._busy(False), messagebox.showerror("取原厂 boot 失败", m)))
+                return
+            except Exception as e:
+                msg = "%s: %s" % (type(e).__name__, e)
+                self.q.put(("log", "[错误] %s" % msg))
+                self.root.after(0, lambda m=msg: (
+                    self._busy(False), messagebox.showerror("取原厂 boot 失败", m)))
+                return
+            finally:
+                if p is not None:
+                    try:
+                        p.close()
+                    except Exception:
+                        pass
+
+            hdr = boot_hdr(info["path"])
+            self.q.put(("log", "  %s %s（%.1f MB）"
+                               % ("OK" if hdr else "XX", info["path"],
+                                  info["bytes"] / 1048576.0)))
+            if hdr:
+                self.q.put(("log", "  ANDROID! 头正常  kernel=%d  ramdisk=%d"
+                                   % (hdr["kernel"], hdr["ramdisk"])))
+            self.root.after(0, lambda: (
+                self._busy(False),
+                messagebox.showinfo(
+                    "原厂 boot 已取出",
+                    "%s\n\n%.1f MB，ANDROID! 头%s。\n\n"
+                    "这是原厂镜像：交给 Magisk 打补丁要的就是它，"
+                    "刷坏了也用它刷回来。"
+                    % (info["path"], info["bytes"] / 1048576.0,
+                       "正常" if hdr else "异常（别拿去刷）"))))
+
+        threading.Thread(target=job, daemon=True).start()
+
+    def start_fastbootd_flash(self):
+        """走 fastbootd（Android 里的 userspace 模式）写 boot。
+
+        和 9008 是同一件事的两种走法：
+          fastbootd  设备正常重启进 fastbootd，10~30 秒，屏幕有提示
+          9008       黑屏进 SoC 下载模式，3~6 分钟，要装 Qualcomm 驱动
+
+        为什么 fastbootd 能过而 bootloader 的 flash 不行：前者在 Android 里
+        用 libfastboot 直接写块设备，后者由 abl 的命令分发表处理 ——
+        ONYX 裁的是后者那张表（实测 remote: 'unknown command'）。
+        """
+        try:
+            import fbdlink
+        except Exception as e:
+            messagebox.showerror("不可用", "加载 fastbootd 模块失败：\n%s" % e)
+            return
+
+        exe = fastboot_exe()
+        if not exe:
+            messagebox.showerror(
+                "没有 fastboot.exe",
+                "包内 assets\\adb\\fastboot.exe 缺失，系统 PATH 里也没有 fastboot。\n"
+                "这个按钮必须有 fastboot 命令行才能用。")
+            return
+
+        path = filedialog.askopenfilename(
+            title="选择要写入的 boot 镜像（Magisk 打好补丁的）",
+            initialdir=self._gp_base(),
+            filetypes=[("boot 镜像", "*.img"), ("全部", "*.*")])
+        if not path:
+            return
+        hdr = boot_hdr(path)
+        if not hdr:
+            messagebox.showerror(
+                "镜像不对",
+                "读不到 ANDROID! 头。\n\n"
+                "recovery / vendor_boot / 普通文件写进 boot 分区会开不了机。")
+            return
+
+        try:
+            slot = self.adb.getprop("ro.boot.slot_suffix") or "_b"
+        except Exception:
+            slot = "_b"
+        part = "boot" + slot
+        size = os.path.getsize(path)
+        if not messagebox.askyesno(
+                "确认用 fastbootd 写 boot",
+                "目标分区：%s\n镜像：%s\n大小：%.1f MB\n\n"
+                "顺序：重启进 fastbootd → 写入 → 重启回系统。\n"
+                "这条通路不需要 root，但需要 bootloader 已解锁。\n\n继续？"
+                % (part, os.path.basename(path), size / 1048576.0)):
+            return
+
+        self._busy(True)
+        self.q.put(("log", "== fastbootd 刷 boot =="))
+        self.q.put(("log", "  分区 %s  镜像 %s（%.1f MB）"
+                           % (part, os.path.basename(path), size / 1048576.0)))
+
+        def qlog(s):
+            self.q.put(("log", "  " + str(s)))
+
+        def job():
+            fb = fbdlink.Fastboot(exe, serial=self.adb.serial, log=qlog)
+            fd = fbdlink.Fastbootd(self.adb, fb, log=qlog)
+            try:
+                ok, how = fd.enter()
+                if not ok:
+                    raise fbdlink.FastbootError(
+                        "进不了 fastbootd：%s\n\n"
+                        "改用「EDL 刷 boot」那条路（9008 直写）。" % how)
+                self.q.put(("log", "  已进 fastbootd（%s）" % how))
+                cap = fd.partition_size(part)
+                if cap and size > cap:
+                    raise fbdlink.FastbootError(
+                        "镜像 %d 字节 > 分区 %s 的 %d 字节" % (size, part, cap))
+                self.q.put(("log", "  写入 %s…" % part))
+                ok, text, used = fd.flash(part, path)
+                if not ok:
+                    raise fbdlink.FastbootError(
+                        "写入失败：%s" % (text[:300] or "无输出"))
+                self.q.put(("log", "  写入完成：%s" % used))
+                fd.reboot()
+            except Exception as e:
+                msg = str(e)
+                self.q.put(("log", "[错误] %s" % msg))
+                self.root.after(0, lambda m=msg: (
+                    self._busy(False),
+                    messagebox.showerror("fastbootd 刷 boot 失败", m)))
+                return
+            self.root.after(0, lambda: (
+                self._busy(False),
+                messagebox.showinfo(
+                    "fastbootd 刷 boot 完成",
+                    "已写入 %s，设备正在重启。\n\n"
+                    "开机后如果没看到 Magisk，先确认 App 已装好，"
+                    "再查这份镜像本身是否真的打过补丁。" % part)))
+
+        threading.Thread(target=job, daemon=True).start()
 
     def start_edl_flash(self):
         """9008 直写 boot 分区。
@@ -2687,6 +2917,64 @@ def _echo_log(logp, tail=200):
         pass
 
 
+def run_payload(ota):
+    """命令行版「取原厂 boot」。返回进程退出码。"""
+    try:
+        import payload as pl
+    except Exception as e:
+        print("加载 payload 模块失败：%s" % e)
+        return 2
+
+    if not ota or ota == "auto":
+        try:
+            here = os.path.dirname(os.path.abspath(sys.argv[0]))
+        except NameError:
+            here = os.getcwd()
+        cands = pl.find_ota(os.path.join(here, "firmware")) or pl.find_ota(os.getcwd())
+        if not cands:
+            print("要给固件包路径：--payload update.zip")
+            print("（把 update.zip 放进 EXE 同级的 firmware\\ 也能自动找到）")
+            return 2
+        ota = str(cands[0])
+        print("自动选用：%s" % ota)
+
+    try:
+        p = pl.Payload(ota)
+    except pl.PayloadError as e:
+        print(e.render())
+        return 1
+
+    info = None
+    try:
+        print("payload v%d，%d 个分区，块 %d 字节"
+              % (p.version, len(p.manifest.partitions), p.manifest.block_size))
+        for part in p.manifest.partitions:
+            print("  " + part.describe())
+        boot = p.find_boot()
+        if boot is None:
+            print("包里既没有 boot 也没有 init_boot")
+            return 1
+        print("")
+        print("打补丁目标：%s（%.1f MB）" % (boot.name, boot.size / 1048576.0))
+        info = p.extract_boot(backup_dir())
+    except pl.PayloadError as e:
+        print(e.render())
+        return 1
+    finally:
+        try:
+            p.close()
+        except Exception:
+            pass
+
+    hdr = boot_hdr(info["path"])
+    print("")
+    print("已写出：%s（%.1f MB）%s"
+          % (info["path"], info["bytes"] / 1048576.0,
+             "，ANDROID! 头正常" if hdr else "，头异常（别拿去刷）"))
+    print("这是原厂镜像：Magisk 打补丁要的就是它，刷坏了也用它刷回来。")
+    return 0 if hdr else 1
+
+
 def main():
     ap = argparse.ArgumentParser(description=APP_NAME)
     ap.add_argument("--check", action="store_true", help="只检测设备，不改动")
@@ -2708,6 +2996,11 @@ def main():
                          "w 是写分区（先备份、写完读回校验、不符自动回滚），"
                          "w 必须带 --yes，否则只打印计划。"
                          "例：--edl w boot_b patched.img --yes")
+    ap.add_argument("--payload", nargs="?", const="auto", default=None,
+                    metavar="UPDATE_ZIP",
+                    help="从官方固件包 update.zip 里抽出原厂 boot.img。"
+                         "不给路径时自动找 EXE 同级 firmware\\ 下的包。"
+                         "纯本地解包：不连设备、不改设备。")
     ap.add_argument("--serial", default=None, help="指定设备序列号")
     ap.add_argument("--force-model", action="store_true",
                     help="型号或内核与本工具适配的不一致时仍然继续。"
@@ -2723,6 +3016,11 @@ def main():
     args, extra = ap.parse_known_args()
     if extra and not args.edl:
         ap.error("unrecognized arguments: %s" % " ".join(extra))
+
+    if args.payload:
+        # 纯本地动作，最先分流：它跟设备、跟 adb 都没关系，
+        # 没插设备时也该能用
+        return run_payload(args.payload)
 
     if args.edl:
         # EDL 单独跑：env/slot/gpt/dump/r 只读；w 会写分区（自带备份 + 读回校验）。

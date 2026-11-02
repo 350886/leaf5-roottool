@@ -58,6 +58,10 @@ DEPS = [
                                              "120bef587119c6cb926b86b9be90fdfbce38937588eae28cd91a94ce63c7b965"),
             "platform-tools/AdbWinUsbApi.dll": ("assets/adb/AdbWinUsbApi.dll",
                                                 "6ca69a2ca0e31309c087d288f058977d421ad03500e4c3e1dbd981241a069c60"),
+            # fastboot.exe 只给「fastbootd 刷 boot」用。ONYX 的 abl 裁掉了 bootloader
+            # 模式的 flash，但 fastbootd 的写入是另一套实现，所以必须带着这条命令行。
+            "platform-tools/fastboot.exe": ("assets/adb/fastboot.exe",
+                                            "dd55fef77ab2753b6423f37f39d91cb00ce53ab4539a2431577f07c4abcaa32a"),
         },
         optional=False,
         note="Google platform-tools r37.0.0",
