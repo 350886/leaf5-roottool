@@ -852,8 +852,11 @@ class AdapterWindow(object):
             self._log(f"  提到 {len(offs)} 个符号偏移，"
                       f"{len(miss)} 个宏没有同名符号（多是硬编码槽位）", "dim")
 
-            fp = (self.meta or {}).get("fingerprint", "")
-            kv = (self.meta or {}).get("kernel", "")
+            # 内核串必须来自这份镜像的 banner，不能借「手上连着的那台设备」：
+            # self.meta 此刻还是空的（_read_device 只在「装进工具」那步调），
+            # 就算读到了也是另一台机器的 uname -r —— 解析别人的 ROM 时
+            # target 会被记成当前设备的内核串，pick_payload 永远比不中。
+            kv, fp = adapter.pick_identity(banner, self.meta or {})
             tid = adapter.suggest_id(fp, kv or os.path.basename(self.elf_path))
             tdir = os.path.join(exploit, "targets", tid)
             unf, nf, diffs = adapter.build_target_h(

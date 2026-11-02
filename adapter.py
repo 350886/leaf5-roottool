@@ -501,9 +501,11 @@ def build_target_h(template_path, out_path, offsets, fingerprint, kernel_ver,
     txt = re.sub(r'#define\s+BUILD_VARIANT_LABEL\s+"[^"]*"',
                  f'#define BUILD_VARIANT_LABEL "migrated_{re.sub(r"[^0-9A-Za-z._-]", "_", os.path.basename(os.path.dirname(out_path)))}"',
                  txt)
-    if fingerprint:
-        txt = re.sub(r'#define\s+BUILD_FINGERPRINT\s+"[^"]*"',
-                     f'#define BUILD_FINGERPRINT "{fingerprint}"', txt)
+    # 指纹只在能确证「这份镜像就是那台设备」时才有值；拿不到就写成空串，
+    # 别把模板里上一台机器的指纹留在文件里 —— 那会让后来的人以为
+    # 这份 target 是给那个型号编的。
+    txt = re.sub(r'#define\s+BUILD_FINGERPRINT\s+"[^"]*"',
+                 f'#define BUILD_FINGERPRINT "{fingerprint or ""}"', txt)
 
     # 顶部加一段"这是迁移生成的"横幅，防止跟原版混淆
     banner = (
@@ -928,6 +930,29 @@ def banner_match(banner, dev_version):
     return ("same",
             "同一构建 %s #%s %s" % (a.get("version"), a.get("build"), a["commit"]),
             "偏移可用")
+
+
+def pick_identity(banner, dev=None, kernel="", fingerprint=""):
+    """
+    决定 target 该记哪套身份：内核串 + build fingerprint。
+
+    优先级：显式传参 > 镜像 banner > 设备。指纹比内核串危险 ——
+    镜像不是这台机器的时候把它设备的指纹抄进去，pick_payload 第二档
+    就会拿这份 so 去喂一台没适配过的机器，崩在内核里。
+    所以指纹只在「镜像内核与设备完全一致，或压根没有镜像 banner」时才继承。
+
+    返回 (kernel, fingerprint)。
+    """
+    dev = dev or {}
+    img_ver = (parse_banner(banner) or {}).get("version") or ""
+    k = kernel or img_ver or dev.get("kernel") or ""
+    if fingerprint:
+        fp = fingerprint
+    elif not img_ver or img_ver == (dev.get("kernel") or ""):
+        fp = dev.get("fingerprint") or ""
+    else:
+        fp = ""
+    return k, fp
 
 
 def _adb_read(remote, adb=None, serial=None, env=None):
@@ -1371,15 +1396,18 @@ def write_sym_fp(src_path, tdir, banner=None):
     banner 一起存：同一个符号序列可能对应多个构建（序列一样但代码有改），
     banner 的 commit 是第二个交叉维度，比对时先用它筛。
     """
-    meta = sym_fingerprint(src_path)
-    if not meta:
-        return None
+    meta = sym_fingerprint(src_path) or {}
     if banner:
         b = parse_banner(banner)
         meta["kernel_banner"] = banner
         meta["kernel_commit"] = b.get("commit")
         meta["kernel_build"] = b.get("build")
         meta["kernel_version"] = b.get("version")
+    # 裸 Image / boot.img 路径算不出 sym_digest（那个要 kallsyms 文本），
+    # 但 banner 一样得存下来 —— 否则 install 时无从判断「这套 so 是给谁的」，
+    # 收口逻辑就只剩设备串可用。
+    if not meta:
+        return None
     os.makedirs(tdir, exist_ok=True)
     p = os.path.join(tdir, "symfp.json")
     with open(p, "w", encoding="utf-8") as f:
@@ -1403,6 +1431,19 @@ def install_target(tid, so_path, meta):
                     meta.setdefault(k, v)
         except Exception:
             pass
+    # 收口：kernel_version 来自内核 banner（这份 so 编自哪份内核），
+    # meta["kernel"] 是「装进工具时连着的那台设备」的 uname -r。
+    # 两者不同 = 手上这套 so 不是给当前设备的，不能让设备串盖掉镜像串 ——
+    # 否则 pick_payload 第三档会把别人的 so 当成这台机器的。
+    kv = meta.get("kernel_version")
+    if kv and meta.get("kernel") and kv != meta["kernel"]:
+        meta["dev_kernel"] = meta["kernel"]      # 留档：install 时连着的那台
+        meta["kernel"] = kv                      # 镜像说了算
+        if meta.get("fingerprint"):
+            # 指纹同理。镜像不是这台机器的，它的 build fingerprint 拿过来用
+            # 就会在第二档被错配给一台没适配过的设备。
+            meta["dev_fingerprint"] = meta["fingerprint"]
+            meta.pop("fingerprint", None)
     meta["so_md5"] = hashlib.md5(open(dst, "rb").read()).hexdigest()
     meta["so_size"] = os.path.getsize(dst)
     meta["created"] = meta.get("created") or time.strftime("%Y-%m-%dT%H:%M:%S")
@@ -1430,7 +1471,10 @@ def pick_payload(dev_fingerprint=None, dev_kernel=None, sym_digest=None):
             return os.path.join(m["dir"], "preload.so"), m
     if dev_kernel:
         for m in cands:
-            if m.get("kernel") and m["kernel"] == dev_kernel:
+            # 第三档同时认 kernel_version：老 manifest 的 kernel 可能记的是
+            # install 时那台设备（见 install_target 的收口），镜像串在
+            # kernel_version 里，不认它就等于漏掉一份本来能用的 so。
+            if dev_kernel in (m.get("kernel"), m.get("kernel_version")):
                 return os.path.join(m["dir"], "preload.so"), m
     return None, None
 
@@ -1502,13 +1546,14 @@ def _cli():
         src, how, banner = resolve_syms_source(a.elf, log=print)
         if how != "direct":
             print(f"  （自动解包：{how}）")
+        dev_ver = ""
         if banner:
             print(f"  镜像 banner: {banner}")
             # 设备连着就顺手对一下构建身份。对不上还硬生成，偏移会打偏、
             # 在内核里随机位置崩 —— 宁可在这一步停下。
             ok, out = _adb_read("/proc/version")
+            dev_ver = out.decode("latin1").strip() if ok else ""
             if ok:
-                dev_ver = out.decode("latin1").strip()
                 v, why, adv = banner_match(banner, dev_ver)
                 tag = {"same": "[OK]", "resame": "[!]", "dirty": "[!]",
                        "different": "[X]", "unknown": "[?]"}[v]
@@ -1527,11 +1572,16 @@ def _cli():
         offs, miss = elfsyms.extract_offsets(src, tmpl, log=print)
         if miss:
             print(f"[i] {len(miss)} 个宏在内核里没有同名符号（多为硬编码槽位，正常）")
-        tid = a.id or suggest_id(a.fingerprint, a.kernel)
+        # 身份：显式参数 > 镜像 banner > 设备。/proc/version 只用来补设备那一档，
+        # 不再让「当前连着的设备」去覆盖镜像的内核串（解析别的机器 ROM 时那会记错）。
+        dev_meta = {"kernel": (parse_banner(dev_ver) or {}).get("version") or ""}
+        kv, fp = pick_identity(banner, dev_meta, kernel=a.kernel,
+                               fingerprint=a.fingerprint)
+        tid = a.id or suggest_id(fp, kv)
         tdir = os.path.join(a.repo, "exploit", "targets", tid)
         unf, nf, diffs = build_target_h(
             tmpl, os.path.join(tdir, "target.h"),
-            offs, a.fingerprint, a.kernel, log=print, syms_mode="trust")
+            offs, fp, kv, log=print, syms_mode="trust")
         print(f"\n生成 {tdir}/target.h")
         sfp = write_sym_fp(src, tdir, banner)
         if sfp:
