@@ -53,7 +53,7 @@ except ImportError:  # 精简版 Python 可能没带 tcl/tk
 # ----------------------------------------------------------------------------
 
 APP_NAME = "Leaf5 Root Tool"
-APP_VER = "1.1.8"
+APP_VER = "1.1.9"
 
 # 本工具适配的唯一目标。写在界面上、写进日志、拿来卡住别的机型。
 # 62 个偏移 + services.jar 补丁点全部绑死在这个三元组上，换任何一个都不成立。
@@ -1706,6 +1706,12 @@ class App:
         root.configure(bg=BG)
 
         self._build()
+        self._build_menu()
+        # 快捷键挂在根窗口上。说明窗口是 Toplevel，它自己另有一套绑定。
+        self.root.bind("<F1>", lambda _e: self.act_help())
+        self.root.bind("<Control-l>", lambda _e: self.act_clear_log())
+        self.root.bind("<Control-q>", lambda _e: self.on_close())
+        self.root.bind("<Control-d>", lambda _e: self.start_detect())
         self._poll()
         self.root.after(300, self.boot)
 
@@ -1995,6 +2001,113 @@ class App:
                   f"   |   adb 端口 {self.port} · 载荷 preload.so 2.4MB"),
             bg=BG, fg=FG_DIM, font=("Microsoft YaHei UI", 8))
         self.lbl_foot.pack(side="left")
+
+    # -- 菜单栏 --------------------------------------------------------------
+
+    def _submenu(self, parent):
+        """深色子菜单。tk 在 Windows 上的默认菜单是浅色的，跟窗口拼一起很突兀，
+        所以每个子菜单都要显式给底色 —— 这个没法从父菜单继承。"""
+        return tk.Menu(parent, tearoff=0, bg=BG2, fg=FG, bd=0,
+                       activebackground=ACCENT, activeforeground="#ffffff",
+                       activeborderwidth=0, font=("Microsoft YaHei UI", 9))
+
+    def _build_menu(self):
+        bar = tk.Menu(self.root, tearoff=0, bg=BG2, fg=FG, bd=0,
+                      activebackground=ACCENT, activeforeground="#ffffff",
+                      activeborderwidth=0, font=("Microsoft YaHei UI", 9))
+
+        m_file = self._submenu(bar)
+        m_file.add_command(label="打开日志目录", command=self.act_open_logs)
+        m_file.add_command(label="打开备份目录", command=self.act_open_backup)
+        m_file.add_separator()
+        m_file.add_command(label="导出使用说明…", command=self.act_export_help)
+        m_file.add_separator()
+        m_file.add_command(label="退出", accelerator="Ctrl+Q",
+                           command=self.on_close)
+        bar.add_cascade(label="文件", menu=m_file)
+
+        m_tool = self._submenu(bar)
+        m_tool.add_command(label="刷新设备", command=self.refresh_devices)
+        m_tool.add_command(label="检测（只读）", accelerator="Ctrl+D",
+                           command=self.start_detect)
+        m_tool.add_separator()
+        m_tool.add_command(label="清空日志窗口", accelerator="Ctrl+L",
+                           command=self.act_clear_log)
+        m_tool.add_command(label="内核适配向导", command=self.open_adapter)
+        bar.add_cascade(label="工具", menu=m_tool)
+
+        m_help = self._submenu(bar)
+        m_help.add_command(label="使用说明", accelerator="F1",
+                           command=self.act_help)
+        m_help.add_command(label="导出为 txt…", command=self.act_export_help)
+        m_help.add_separator()
+        m_help.add_command(label="项目主页", command=self.act_homepage)
+        m_help.add_command(label="关于", command=self.act_about)
+        bar.add_cascade(label="帮助", menu=m_help)
+
+        self.root.configure(menu=bar)
+        self.menubar = bar
+
+    # -- 菜单动作 ------------------------------------------------------------
+
+    def _open_dir(self, path):
+        """用资源管理器打开目录。不用 webbrowser：它会拿默认浏览器去开
+        file:// 目录，装过某些浏览器时表现是「弹个空白页」。"""
+        try:
+            os.makedirs(path, exist_ok=True)
+            os.startfile(path)            # noqa: S606  Windows only
+        except Exception as e:
+            self.log("打不开目录 %s：%s" % (path, e), "bad")
+
+    def act_open_logs(self):
+        self._open_dir(os.path.join(app_data_dir(), "logs"))
+
+    def act_open_backup(self):
+        self._open_dir(backup_dir())
+
+    def act_clear_log(self):
+        """只清界面，不动盘上的日志 —— 日志是事后唯一证据，不能因为看着乱就删。"""
+        try:
+            self.txt.configure(state="normal")
+            self.txt.delete("1.0", "end")
+            self.txt.configure(state="disabled")
+        except Exception:
+            pass
+
+    def act_help(self):
+        try:
+            import helpwin
+        except Exception as e:
+            messagebox.showerror(APP_NAME, "加载使用说明失败：%s" % e)
+            return
+        helpwin.open_help(self.root)
+
+    def act_export_help(self):
+        try:
+            import helpwin
+            path = helpwin.export_plain(self.root)
+        except Exception as e:
+            messagebox.showerror(APP_NAME, "导出失败：%s" % e)
+            return
+        if path:
+            self.log("使用说明已导出：%s" % path, "dim")
+
+    def act_homepage(self):
+        try:
+            import webbrowser
+            webbrowser.open("https://github.com/350886/leaf5-roottool")
+        except Exception as e:
+            self.log("打不开浏览器：%s" % e, "bad")
+
+    def act_about(self):
+        try:
+            import helpwin
+        except Exception as e:
+            messagebox.showerror(APP_NAME, "加载失败：%s" % e)
+            return
+        helpwin.open_about(self.root, app_name=APP_NAME, app_ver=APP_VER,
+                           model=TARGET_MODEL, firmware=TARGET_FIRMWARE,
+                           kernel=TARGET_KERNEL)
 
     def _btn(self, parent, text, cmd, primary=False, danger=False, w=9):
         bg = ACCENT if primary else (BG3 if not danger else "#5a1d1d")

@@ -29,7 +29,7 @@ GP_NAME = "Leaf5RootTool_gplay"
 # 换成自签名证书后，别人从 EXE 里能读到的只有这一个名字，不含公司名/个人信息。
 # 想换：set LEAF5_SIGN_CN=CN=你自己的名字 后跑 --sign，或改这里重新生成证书。
 SIGN_CN = "SWT"
-VERSION = (1, 1, 8, 0)
+VERSION = (1, 1, 9, 0)
 
 # fastboot.exe 和 adb 共用 AdbWinApi.dll / AdbWinUsbApi.dll，一起进 assets/adb。
 # 它只给「fastbootd 刷 boot」用：ONYX 的 abl 裁掉了 bootloader 模式的 flash，
@@ -297,9 +297,12 @@ def main():
     # libusb-1.0.dll 跟着 libusb_package 走；不 collect 的话运行期
     # add_dll_directory 会落空，pyusb 报 "No backend available"
     base += ["--collect-all", "libusb_package"]
+    # helpdoc / helpwin 是「菜单点开才 import」的，模块图能扫到，但写在这里
+    # 是给后来的人一个明确交代：这两个文件必须进包，缺了表现是点 F1 报错。
     for mod in ("adapter", "adapter_ui", "elfsyms", "ndkman", "fp",
                 "imageksym", "edlman", "a64", "autopilot", "gp",
                 "edlmain", "edlclient", "edllink", "drivers", "usbtrace",
+                "helpdoc", "helpwin",
                 "docopt", "usb", "serial", "capstone", "colorama"):
         base += ["--hidden-import", mod]
 
