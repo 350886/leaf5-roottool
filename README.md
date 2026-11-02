@@ -331,6 +331,55 @@ Tab10 是另一个 commit（`g45e1596201e0`），与 Tab8C/Tab8 差 **60.33%**�
 所以在 Tab 上，现实目标排序是：`adb root`（若 userdebug 成立）→ 临时 root →
 Magisk 持久化（基本别指望）。
 
+#### 五、适配编译实测（2026-11-02）
+
+四份原厂 Image 各走一遍完整适配链（解析 → `gen` 出 `target.h` → `build` 编 `preload.so`），
+数字都是本机跑出来的：
+
+| 型号 | 固件 | 内核 commit / 构建号 | 解出符号 | 62 宏命中 | 与出厂模板差异 | 手工宏 4 项 | V1 编出 `preload.so` |
+|---|---|---|---:|---:|---:|---|---:|
+| Leaf5 | 4.2.3-rel_0928 | `g77c132eccfab-dirty` #38 | 117,009 | 55 | 10 | 按模板值手填 | 2,494,504 |
+| Tab8 | 4.2-rel_0603 | `ge2582afab8ec-dirty` #11 | 110,455 | 55 | 55 | 同上 | 2,494,520 |
+| Tab8C | 4.2-rel_0605 | `ge2582afab8ec-dirty` #12 | 110,455 | 55 | 55 | 同上 | 2,494,520 |
+| Tab10 | 4.2-rel_0630 | `g45e1596201e0-dirty` #41 | 110,457 | 55 | 55 | 同上 | 2,494,520 |
+
+- 「与出厂模板差异」= 62 个 `*_OFF` 宏里跟 `targets/onyx-leaf5/target.h` 值不同的个数。
+  Leaf5 差 10 个、三台 Tab 差 55 个 —— **换构建号必须整套重算**，抄模板必崩。
+- 4 个手工宏（`TASK_REAL_CRED_OFF` / `TASK_CRED_OFF` / `PRCTL_FRAME_TOTAL` /
+  `WAITER_LOCAL_OFF`）V1 没有指令扫描，是按模板值填的；V2 能自动定标，四份 ROM
+  扫出来都是 `0x7D8 / 0x7E0 / 0x200 / 0x50`，与模板一致。
+- 两版 `target.h` 的 163 个宏**逐条完全一致**（四份 ROM 全部 0 处不一致），
+  说明两套符号提取路径没有分叉。
+- 交叉验证：同一份 Leaf5 Image 用 `kallsyms-finder` 独立解一遍，符号集合 0 多 0 少，
+  地址 98.1% 相同，差的那 1.9% 是重名符号（同名取到不同的那份）。
+
+#### 六、root 成不成功（2026-11-02）
+
+| 设备 | 是否 root | 依据 | 怎么测的 |
+|---|---|---|---|
+| Leaf5（`e913138`） | **是** | `id` → `uid=0(root)`、`context=u:r:magisk:s0`；`magisk -v` → `31.1:MAGISK:R`；`su` 在 `/product/bin/su` 与 `/debug_ramdisk/su` | 只读命令（`--check`） |
+| Tab8 | 未测 | 没有真机 | — |
+| Tab8C | 未测 | 没有真机 | — |
+| Tab10 | 未测 | 没有真机 | — |
+
+Leaf5 现场（只读采集）：`selinux=Permissive`、`verity=enforcing`、`slot=_b`、`boot_completed=1`。
+
+`Leaf5RootTool.exe --check` 对这台机器的判定：已 root / `/debug_ramdisk/su` 存在 /
+提示不必再跑 exploit —— 与本轮手工 `id` 的结果一致。
+
+**边界说清楚**：Leaf5 的 `uid=0` 是这台机器**既有**状态（出厂载荷 `preload.so`
+`md5 6f36e1e8…` 早先实测跑出来的），本轮没有重跑 `--auto`（跑一次就是改设备状态）。
+三台 Tab 判「可以试」的依据只有**载荷编得出来 + 内核前提同构**，
+不等于在真机上拿得到 `uid=0` —— 所以标「未测」，不标「应该能」。
+
+拿到 Tab 机器的复现顺序（前两步都不写设备）：
+
+```bash
+adb shell getprop ro.debuggable          # 1 就直接 adb root，不用 exploit
+Leaf5RootTool.exe --check                # 2 只读：认机型、认内核、认现有 su
+Leaf5RootTool.exe --auto --force-model   # 3 只跑临时 root，重启即恢复
+```
+
 #### 怎么复现
 
 ```bash

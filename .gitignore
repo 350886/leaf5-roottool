@@ -44,6 +44,11 @@ _bak_*/
 roottool.py.bak_before_safety
 
 # ── 测试现场（只留两个可复跑的脚本）────────────────────────────────
+# 2026-11-02 四机型适配实测留下的中间件：编出的 .so、设备指纹、kallsyms 文本
+work_rom/
+work_v1test/
+work_v1_fp.json
+work_v1_syms.txt
 _test_dump/adb_side/
 _test_dump/edl_side/
 _test_dump/edl_side2/
