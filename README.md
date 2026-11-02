@@ -594,7 +594,8 @@ python build.py --apk X.apk  # 指定打进带版里的包
 里跑完三轮约束写，把 uid 改成 0 并装一个 `/data/local/tmp/su`。
 
 - 单轮约 96 秒，成功率约 2/3；默认重试 3 次，累计 ≈96%
-- `need CAP_SYS_ADMIN` 勾上后，只有拿到 bit21 才收工（该位由 KASLR 抽签决定，约一半概率）
+- `need CAP_SYS_ADMIN` 勾上后，只有拿到 bit21 才收工（该位由 KASLR 抽签决定，约一半概率）；
+  日志里读不到 `bnd=` 也判失败，不放行 —— 确认不了能力就不说通过
 - 重启后 SELinux 回 Enforcing，临时 root 失效，要重跑
 
 **2. 安装 Magisk（可选，勾了会自动勾第 3 项）**
@@ -697,6 +698,10 @@ CLI 输出同时写一份 UTF-8 日志到
 
 ⚠ 判断 `CAP_SYS_ADMIN` 要看 route 日志里的 `bnd=`，**不要看 exec 后的 `CapEff`** ——
 这个内核 `execve` 的 `pP'` 落在 inheritable 上，`CapEff` 只是 `CapInh` 的镜像。
+
+勾了 `--sysadmin` 但日志里读不到 `bnd=` 时，这一轮直接判失败（1.1.6 起）。
+旧版是「读不到就不查」，等于把下一个动作（`mount` 只读分区）赌在运气上；现在与
+`l5tk root exploit --sysadmin` 的判定一致：确认不了就不算通过。
 
 ---
 

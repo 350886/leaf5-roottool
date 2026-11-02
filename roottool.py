@@ -51,7 +51,7 @@ except ImportError:  # 精简版 Python 可能没带 tcl/tk
 # ----------------------------------------------------------------------------
 
 APP_NAME = "Leaf5 Root Tool"
-APP_VER = "1.1.4"
+APP_VER = "1.1.6"
 
 # 本工具适配的唯一目标。写在界面上、写进日志、拿来卡住别的机型。
 # 62 个偏移 + services.jar 补丁点全部绑死在这个三元组上，换任何一个都不成立。
@@ -69,6 +69,9 @@ DEV_PROBE = f"{DEV_ROOT}/exec_probe.txt"
 MIN_UP = 90
 # 每轮从起跑到收工的上限。实测 96 秒收工，失败约 210 秒
 ROUND_LIMIT = 210
+
+# CAP_SYS_ADMIN 在位掩码里的位置（linux/capability.h）。mount 只读分区要靠它。
+CAP_SYS_ADMIN = 21
 # 单轮 exploit 的 timeout(1) 参数
 RUN_TIMEOUT = 150
 SLEEP_SEC = 480
@@ -1047,13 +1050,24 @@ class RootWorker(threading.Thread):
         if "uid=0" not in idline:
             info["reason"] = f"cap 有了但 uid 没到 0：{idline or '(空)'}"
             return False, info
-        if self.require_sysadmin and bnd:
-            try:
-                if not (int(bnd, 16) >> 21) & 1:
-                    info["reason"] = "这轮没有 CAP_SYS_ADMIN（KASLR slide 抽签），换一轮"
-                    return False, info
-            except ValueError:
-                pass
+        # 与 V2 的 ExploitOps.verdict() 对齐：读不到 bnd 也判失败。
+        # 旧写法是 `if self.require_sysadmin and bnd:` + `except ValueError: pass` ——
+        # route 日志里没有 bnd= 那一行时直接放行，等于把「能不能 mount / 改只读挂载」
+        # 赌在下一轮运气上。确认不了能力就别说通过。
+        if self.require_sysadmin:
+            val = None
+            if bnd:
+                try:
+                    val = int(bnd, 16)
+                except ValueError:
+                    val = None
+            if val is None:
+                info["reason"] = "有 uid=0，但日志里读不到 bnd=，无法确认 CAP_SYS_ADMIN"
+                return False, info
+            if not (val >> CAP_SYS_ADMIN) & 1:
+                info["reason"] = ("有 uid=0，但 CAP_SYS_ADMIN 不在 bnd 里（bnd=0x%x）；"
+                                  "这个能力决定能不能 mount / 改只读挂载" % val)
+                return False, info
         return True, info
 
     def stage_root(self, base=0.15, span=0.85):
@@ -1101,7 +1115,7 @@ class RootWorker(threading.Thread):
             if info.get("bnd"):
                 try:
                     v = int(info["bnd"], 16)
-                    self.log(f"    bit21(CAP_SYS_ADMIN)={(v >> 21) & 1}")
+                    self.log(f"    bit{CAP_SYS_ADMIN}(CAP_SYS_ADMIN)={(v >> CAP_SYS_ADMIN) & 1}")
                 except ValueError:
                     pass
             if ok:
