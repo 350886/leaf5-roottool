@@ -551,7 +551,8 @@ class Pilot(object):
                 "  打开「内核适配向导」，手工填完这几个再编译。"
                 % (len(unf), ", ".join(unf)))
 
-        adapter.write_sym_fp(src, tdir, banner)
+        adapter.write_sym_fp(src, tdir, banner,
+                             kernel=self.dev.get("kernel_ver") or "")
         self.log(f"  → {tdir}/target.h")
         if diffs:
             self.log(f"  {len(diffs)} 个宏与模板原值不同（换了内核，正常）")

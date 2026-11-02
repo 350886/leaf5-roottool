@@ -323,12 +323,28 @@ def match(fp, targets):
     sym = fp.get("sym") or {}
     dg = sym.get("sym_digest", "")
     n = sym.get("kernel_syms", 0)
+    zeroed = sym.get("zeroed") or 0
     ver = fp.get("kernel_ver", "")
+    # 候选里有没有一份记过符号指纹。没有的话「符号序列不同」这句话是假的，
+    # 真实情况是「没记，无从比较」——两者给的下一步完全不同。
+    have_digest = any(m.get("sym_digest") for m in (targets or []))
+    # 由内核镜像（boot.img / 裸 Image）适配出来的 target 带 banner 但没有
+    # sym_digest：镜像里只有符号地址，反解出的名字序列与 /proc/kallsyms 的
+    # 去重规则不同，硬比对会误判。这种情况只能按内核串认。
+    from_image = any(m.get("banner") for m in (targets or [])
+                     if not m.get("sym_digest"))
+
+    # 地址不可见 ≠ 没 root：已 root 但 kptr_restrict=2 时也是全 0。
+    # 混成一句「先 root」会让人反复确认一件已经成立的事。
+    _hidden = ("地址列被 kptr_restrict 隐藏了（这不是没 root）。"
+               "能改就先 `su -c 'echo 0 > /proc/sys/kernel/kptr_restrict'` "
+               "再导一次；改不了就走 boot.img / vmlinux.elf 那条路")
+    _noroot = "先把设备 root 起来，再从设备读 kallsyms 生成第一份 target"
 
     if not targets:
         return {"verdict": "no_target", "id": None,
                 "why": "工具里还没有任何适配过的内核",
-                "advice": "先把设备 root 起来，再从设备读 kallsyms 生成第一份 target"}
+                "advice": _hidden if zeroed else _noroot}
 
     if dg:
         for m in targets:
@@ -341,11 +357,18 @@ def match(fp, targets):
     if ver:
         for m in targets:
             if m.get("kernel") and m["kernel"] == ver:
-                return {"verdict": "same_version", "id": m["id"],
-                        "why": f"内核版本串相同（{ver}），但符号序列不同"
-                               f"（本机 {n} 个）—— 同版本的不同构建",
+                if have_digest:
+                    why = (f"内核版本串相同（{ver}），但符号序列不同"
+                           f"（本机 {n} 个）—— 同版本的不同构建")
+                elif from_image:
+                    why = (f"内核版本串相同（{ver}），这份 target 由内核镜像"
+                           f"适配而来，镜像里没有可比的符号名序列，只能按内核串认")
+                else:
+                    why = (f"内核版本串相同（{ver}），但这份 target 没记符号指纹"
+                           f"（旧版 gen 装的），无法按序列核对")
+                return {"verdict": "same_version", "id": m["id"], "why": why,
                         "advice": "偏移可能不同，先用「从设备读符号」核实；"
-                                  "没 root 的话不要硬试，内核会 panic"}
+                                  "没核实前不要硬试，内核会 panic"}
 
     same_n = [m for m in targets
               if n and m.get("sym_count") and m["sym_count"] == n]
@@ -354,11 +377,12 @@ def match(fp, targets):
                 "why": f"版本串不同（{ver}），但符号数一样（{n} 个），"
                        f"可能只是改了版本串的重新打包",
                 "advice": "有 root 就跑「从设备读符号」核对；"
-                          "没 root 不要试，概率不高"}
+                          "没核实前不要试，概率不高"}
 
     return {"verdict": "different", "id": None,
             "why": f"内核版本串 {ver or '?'}，符号 {n or '?'} 个 —— 没有匹配的 target",
-            "advice": "这是陌生内核。设备必须先 root，"
+            "advice": _hidden if zeroed else
+                      "这是陌生内核。设备必须先 root，"
                       "再用「从设备读符号」拉完整 kallsyms 生成新 target"}
 
 

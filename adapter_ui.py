@@ -866,7 +866,7 @@ class AdapterWindow(object):
             self.tdir = tdir
             self.diffs = diffs
             # 把符号序列指纹跟着 target 存下来，以后同一台设备不用 root 就能认出来
-            sfp = adapter.write_sym_fp(src, tdir, banner)
+            sfp = adapter.write_sym_fp(src, tdir, banner, kernel=kv)
             if sfp:
                 self._log(f"  符号指纹 {os.path.basename(sfp)} 已存"
                           f"（设备指纹能认出这次构建）", "dim")

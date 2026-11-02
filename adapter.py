@@ -389,21 +389,32 @@ def grab_kallsyms(out_path=None, serial=None, adb=None, log=None):
     ks = elfsyms.Kallsyms(out_path)
     say(f"  {size} 字节，{ks.total} 行，有效符号 {len(ks.symbols())}，"
         f"零地址 {ks.zeroed}")
+
+    def _reject(msg):
+        """校验不过就删掉文件：留着它和正常导出同名同大小，
+        下一步 gen 报「没有有效地址」，错在上一层却要人在下一层猜。"""
+        try:
+            os.remove(out_path)
+        except OSError:
+            pass
+        raise AdapterError(msg)
+
     if size < 512 * 1024:
-        raise AdapterError(
+        _reject(
             "导出只有 %d 字节，太小了。设备上 /proc/kallsyms 一般 5~7MB。\n"
             "  su 可能没拿到 root，或内核编译时关了 CONFIG_KALLSYMS。"
             % size)
     if ks.zeroed:
-        raise AdapterError(
+        _reject(
             "有 %d/%d 条地址是 0，这份文件不能用（kptr_restrict 没关掉）。\n"
             "  设备上手动确认：\n"
             "    adb shell su -c 'cat /proc/sys/kernel/kptr_restrict'   → 想要 0\n"
             "    adb shell su -c 'head -3 /proc/kallsyms'              → 第一列不能全 0\n"
-            "  有些内核不允许改这个值，那就只能走 vmlinux.elf 那条路。"
+            "  能写时先 `su -c 'echo 0 > /proc/sys/kernel/kptr_restrict'` 再导一次；\n"
+            "  有些内核不允许改这个值，那就只能走 boot.img / vmlinux.elf 那条路。"
             % (ks.zeroed, ks.total))
     if "_text" not in ks.symbols():
-        raise AdapterError("这份 kallsyms 里没有 _text，可能被裁剪过")
+        _reject("这份 kallsyms 里没有 _text，可能被裁剪过")
     base_addr = ks.symbols()["_text"][0]
     say(f"  _text = 0x{base_addr:016X}")
     return out_path, {"lines": ks.total, "syms": len(ks.symbols()),
@@ -894,6 +905,10 @@ def parse_banner(text):
     return out
 
 
+VERDICT_TAG = {"same": "[OK]", "resame": "[!]", "dirty": "[!]",
+               "different": "[X]", "unknown": "[?]"}
+
+
 def banner_match(banner, dev_version):
     """
     镜像 banner vs 设备 /proc/version。
@@ -980,7 +995,7 @@ def banner_check(path, adb=None, serial=None, env=None, log=None):
     mine = read_kernel_banner(path)
     if not mine:
         return None
-    say("  镜像 banner: %s" % mine)
+    # banner 原文不在这里打：CLI 会带标题打一遍，这里再打就是两遍。
     dev = None
     ok, out = _adb_read("/proc/version", adb=adb, serial=serial, env=env)
     if ok:
@@ -989,13 +1004,9 @@ def banner_check(path, adb=None, serial=None, env=None, log=None):
         return dict(image=mine, device=None, verdict="unknown",
                     why="设备没连（或 /proc/version 读不出来），只解析了镜像",
                     advice="连上设备再跑一次")
-    say("  设备 version: %s" % dev)
     v, why, adv = banner_match(mine, dev)
-    tag = {"same": "[OK]", "resame": "[!]", "dirty": "[!]",
-           "different": "[X]", "unknown": "[?]"}[v]
-    say("  %s %s" % (tag, why))
-    if v != "same":
-        say("      %s" % adv)
+    # 判定不在这里打印：CLI 要点的是独立那行「结论：…」，GUI 有自己的展示位。
+    # 两处各打一遍会变成同一条信息重复两次。
     return dict(image=mine, device=dev, verdict=v, why=why, advice=adv)
 
 
@@ -1388,13 +1399,15 @@ def sym_fingerprint(src_path):
             "sym_module": st["module_syms"]}
 
 
-def write_sym_fp(src_path, tdir, banner=None):
+def write_sym_fp(src_path, tdir, banner=None, kernel=None):
     """
     把符号指纹存到 targets/<id>/symfp.json。
     install 的时候自动并进 manifest，这样"认出设备"的能力跟着 target 走。
 
     banner 一起存：同一个符号序列可能对应多个构建（序列一样但代码有改），
     banner 的 commit 是第二个交叉维度，比对时先用它筛。
+    kernel 是「没有 banner 时的内核算串」（比如纯 kallsyms 导出）：
+    少了它，install 出来的 manifest 里 kernel 是空的，第三档比不了。
     """
     meta = sym_fingerprint(src_path) or {}
     if banner:
@@ -1403,6 +1416,8 @@ def write_sym_fp(src_path, tdir, banner=None):
         meta["kernel_commit"] = b.get("commit")
         meta["kernel_build"] = b.get("build")
         meta["kernel_version"] = b.get("version")
+    elif kernel:
+        meta["kernel_version"] = kernel
     # 裸 Image / boot.img 路径算不出 sym_digest（那个要 kallsyms 文本），
     # 但 banner 一样得存下来 —— 否则 install 时无从判断「这套 so 是给谁的」，
     # 收口逻辑就只剩设备串可用。
@@ -1415,7 +1430,35 @@ def write_sym_fp(src_path, tdir, banner=None):
     return p
 
 
-def install_target(tid, so_path, meta):
+def _find_symfp(tid, so_path=None, repo=None):
+    """找 gen 阶段留下的 symfp.json。
+
+    为什么需要这一步：gen 把符号指纹写在「仓库」的 targets/<id>/ 里，
+    而 install 收进的是「应用目录」%LOCALAPPDATA%\\Leaf5RootTool\\targets/<id>\\。
+    两个地方，install 时 tdir 里根本没有 symfp.json —— 于是 manifest 少了
+    sym_digest，pick/match 的第一档（符号序列完全一致）永远命中不了，
+    还会误报「同版本不同构建」。
+
+    按可靠性从高到低找：显式给的文件 → so 同目录 → 仓库 → 应用目录 → 包内。
+    """
+    cands = []
+    if so_path:
+        cands.append(os.path.join(
+            os.path.dirname(os.path.abspath(so_path)), "symfp.json"))
+    for base in ([repo] if repo else []):
+        cands.append(os.path.join(base, "exploit", "targets", tid, "symfp.json"))
+        cands.append(os.path.join(base, "targets", tid, "symfp.json"))
+    cands.append(os.path.join(targets_root(), tid, "symfp.json"))
+    pe = _packaged_exploit()
+    if pe:
+        cands.append(os.path.join(pe, "targets", tid, "symfp.json"))
+    for p in cands:
+        if os.path.isfile(p):
+            return p
+    return None
+
+
+def install_target(tid, so_path, meta, symfp=None, repo=None):
     """把编好的 preload.so 收进 targets/<tid>/，写 manifest"""
     tdir = os.path.join(targets_root(), tid)
     os.makedirs(tdir, exist_ok=True)
@@ -1423,12 +1466,13 @@ def install_target(tid, so_path, meta):
     shutil.copyfile(so_path, dst)
     meta = dict(meta)
     # gen 阶段存下的符号指纹并进来（install 的人不必再传一遍）
-    sfp = os.path.join(tdir, "symfp.json")
-    if os.path.isfile(sfp):
+    sfp = symfp or _find_symfp(tid, so_path, repo)
+    if sfp:
         try:
             with open(sfp, encoding="utf-8") as f:
                 for k, v in json.load(f).items():
                     meta.setdefault(k, v)
+            meta["symfp_from"] = sfp
         except Exception:
             pass
     # 收口：kernel_version 来自内核 banner（这份 so 编自哪份内核），
@@ -1436,7 +1480,12 @@ def install_target(tid, so_path, meta):
     # 两者不同 = 手上这套 so 不是给当前设备的，不能让设备串盖掉镜像串 ——
     # 否则 pick_payload 第三档会把别人的 so 当成这台机器的。
     kv = meta.get("kernel_version")
-    if kv and meta.get("kernel") and kv != meta["kernel"]:
+    if kv and not meta.get("kernel"):
+        # install 时没给 --kernel（比如纯 kallsyms 适配、手上没连着设备）：
+        # gen 阶段记下的镜像内核串就是唯一身份，必须填进去 —— 空着的话
+        # pick 第三档没得比，manifest 看起来像「不知道该给谁用」。
+        meta["kernel"] = kv
+    elif kv and meta.get("kernel") and kv != meta["kernel"]:
         meta["dev_kernel"] = meta["kernel"]      # 留档：install 时连着的那台
         meta["kernel"] = kv                      # 镜像说了算
         if meta.get("fingerprint"):
@@ -1536,12 +1585,28 @@ def _cli():
     p5.add_argument("--id", required=True)
     p5.add_argument("--fingerprint", default="")
     p5.add_argument("--kernel", default="")
+    p5.add_argument("--symfp", default=None,
+                    help="gen 产出的 symfp.json（不给就按 so 同目录 / 仓库自动找）")
+    p5.add_argument("--repo", default=None,
+                    help="leaf5-ghostlock 仓库根，用来找 targets/<id>/symfp.json")
 
     a = ap.parse_args()
     if a.cmd == "unpack":
         print(vmlinux_from_boot(a.boot, a.out, log=print))
     elif a.cmd == "gen":
         tmpl = os.path.join(a.repo, "exploit", "targets", "onyx-leaf5", "target.h")
+        if not os.path.isfile(tmpl):
+            # 两种仓库布局都认：含 exploit/ 的根（本命令要的），和直接含 src/
+            # 的那层（build.py 的 EXPLOIT_REPO 要的）。指错了就明说，别等
+            # FileNotFoundError 冒到用户脸上。
+            alt = os.path.join(a.repo, "targets", "onyx-leaf5", "target.h")
+            if os.path.isfile(alt):
+                print("[X] --repo 指到 exploit\\ 里面了，要退一层：%s"
+                      % os.path.dirname(a.repo.rstrip("\\/")))
+                return 2
+            print("[X] 这个仓库里找不到模板：%s" % tmpl)
+            print("    --repo 要给包含 exploit/ 的那一层（例如 assets/exploit_src）")
+            return 2
         print(f"符号来源：{a.elf}")
         src, how, banner = resolve_syms_source(a.elf, log=print)
         if how != "direct":
@@ -1569,6 +1634,13 @@ def _cli():
                 print("  [i] 设备没连，跳过构建身份比对（生成的偏移未经验证）")
         else:
             print("  [!] 读不到 linux_banner —— 这个文件可能不是完整内核镜像")
+            # 纯 kallsyms 文本没有 banner，但「这台设备的内核串」还是拿得到。
+            # 记进 target 之后，pick/match 的第三档（内核串）才有得比；
+            # 不记的话 target 里 kernel 永远是 ?，只能靠符号指纹一档硬碰。
+            ok, out = _adb_read("/proc/version")
+            dev_ver = out.decode("latin1").strip() if ok else ""
+            if dev_ver:
+                print(f"  设备 version: {dev_ver}（来源：/proc/version）")
         offs, miss = elfsyms.extract_offsets(src, tmpl, log=print)
         if miss:
             print(f"[i] {len(miss)} 个宏在内核里没有同名符号（多为硬编码槽位，正常）")
@@ -1583,7 +1655,7 @@ def _cli():
             tmpl, os.path.join(tdir, "target.h"),
             offs, fp, kv, log=print, syms_mode="trust")
         print(f"\n生成 {tdir}/target.h")
-        sfp = write_sym_fp(src, tdir, banner)
+        sfp = write_sym_fp(src, tdir, banner, kernel=kv)
         if sfp:
             print(f"符号指纹已存 {sfp}"
                   f"（之后同一台设备不用 root 就能被认出来）")
@@ -1612,9 +1684,12 @@ def _cli():
         if a.device:
             v, why, adv = banner_match(res["image"], a.device)
             res.update(device=a.device.strip(), verdict=v, why=why, advice=adv)
-            print("\n结论：%s\n      %s" % (why, adv))
-        elif res["verdict"] == "unknown":
-            print("\n" + res["advice"])
+        # 判定要独立成行、不带日志前缀：这一个词决定「这份镜像能不能直接
+        # 拿去生成 target.h」，混在 banner 输出里等于没给。
+        print("\n结论：%s %s" % (VERDICT_TAG.get(res["verdict"], "[?]"),
+                                res["why"]))
+        if res["verdict"] != "same":
+            print("      %s" % res["advice"])
         print("\n镜像 banner：%s" % res["image"])
         if res.get("device"):
             print("设备 version：%s" % res["device"])
@@ -1631,9 +1706,11 @@ def _cli():
         print(f"       {res['advice']}")
         print(f"\n指纹包：{path}")
         if res["verdict"] != "same_build":
-            print("\n要生成新 target 必须有 root（设备上没有别的地址来源）：")
-            print("  python adapter.py kallsyms -o syms.txt")
-            print("  python adapter.py gen syms.txt --repo <仓库根>")
+            print("\n生成新 target 的两条路（按手上有什么挑一条）：")
+            print("  设备能拿到地址：adapter.py kallsyms -o syms.txt"
+                  "   → gen syms.txt --repo <仓库根>")
+            print("  有固件包      ：adapter.py unpack boot.img -o vmlinux.elf"
+                  " → gen vmlinux.elf --repo <仓库根>")
     elif a.cmd == "match":
         import fp as fpmod
         f = fpmod.load(a.fp)
@@ -1648,11 +1725,38 @@ def _cli():
             print(f"{m['id']}  {m.get('kernel','?'):<42} {m.get('so_md5','?')}")
     elif a.cmd == "install":
         d = install_target(a.id, a.so, {"fingerprint": a.fingerprint,
-                                        "kernel": a.kernel})
+                                        "kernel": a.kernel},
+                           symfp=a.symfp, repo=a.repo)
+        man = json.load(open(os.path.join(d, "manifest.json"), encoding="utf-8"))
         print(d)
+        # 把「有没有记上符号指纹」明说出来：这是 pick 第一档能不能命中的前提，
+        # 缺了它后面的 match 只会说「同版本不同构建」，人以为真不一样。
+        print("  符号指纹：%s"
+              % ("已记（%s）" % (man.get("sym_digest", "")[:16])
+                 if man.get("sym_digest") else
+                 "未记 —— pick/match 用不了符号序列这一档，"
+                 "补 `--symfp <仓库>/exploit/targets/%s/symfp.json`" % a.id))
     else:
         ap.print_help()
 
 
 if __name__ == "__main__":
-    _cli()
+    # 兜底：适配过程里最常见的错误是「文件不存在 / 镜像格式不对 / 找不到
+    # exploit 源码」，这些该打成一句人话；只有开了 MIGRATION_DEBUG 才给堆栈。
+    # 返回值也要往上传（banner different 走 return 5），否则脚本永远看到 0。
+    try:
+        sys.exit(_cli() or 0)
+    except AdapterError as e:
+        print("\n[X] %s" % e)
+        sys.exit(2)
+    except FileNotFoundError as e:
+        print("\n[X] 找不到文件：%s" % (e.filename or e))
+        sys.exit(2)
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except Exception as e:                      # noqa: BLE001
+        if os.environ.get("MIGRATION_DEBUG"):
+            raise
+        print("\n[X] %s: %s" % (type(e).__name__, e))
+        print("    排查用：set MIGRATION_DEBUG=1 再跑一次看完整堆栈")
+        sys.exit(3)
