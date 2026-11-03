@@ -154,11 +154,16 @@ ONYX 的 abl 把 `fastboot flash` 这条 handler 裁了 —— bootloader 模式
 ## fastbootd 刷 boot 的顺序
 - 1 本地验 `ANDROID!` 头
 - 2 按 `ro.boot.slot_suffix` 定分区（Leaf5 是 A/B，落到 `boot_b`）
-- 3 `fastboot reboot fastboot`，等 `is-userspace: yes`
-- 4 比 `partition-size`，装不下就停
-- 5 写
-- 6 失败 → 刷回进 fastbootd 之前备份的那份，再重启
-- 7 成功 → 重启回 Android
+- 3 **先备份**：`dd` 出原分区、拉回 PC、校验 md5。必须赶在重启之前 ——
+  进了 fastbootd 就 adb 断了，读不了块设备。这一步读不出来就中止，
+  一个字节都不写（boot 刷坏是这台机器上唯一不能自救的分区）
+- 4 `fastboot reboot fastboot`，等 `is-userspace: yes`
+- 5 比 `partition-size`，装不下就停
+- 6 写
+- 7 失败 → 刷回第 3 步的那份备份，再重启
+- 8 成功 → 重启回 Android
+
+> `--no-backup`（EDL 那条路的参数）已经停用：备份不是可选项。传了会直接拒绝。
 
 ## EDL 刷 boot 的顺序
 - 1 分区必须在 GPT 里，容量装得下镜像
@@ -168,7 +173,9 @@ ONYX 的 abl 把 `fastboot flash` 这条 handler 裁了 —— bootloader 模式
 - 5 不符 → 用备份写回，报「已回滚」
 - 6 reset 离开下载模式
 
-> programmer 必须与 SoC 匹配：Leaf5 是 LITO，`lito_op_n10_fhprg.bin` 已内置；
+> programmer 必须与 SoC 匹配：Leaf5 是 LITO，内置 `lito_moto_fhprg.bin`（默认）
+> 和 `lito_op_n10_fhprg.bin`（备份件——它是受限构建，MaxPayload 只有 16KB，
+> `program` 一律被 `Device verified failed` 挡掉，只能读不能写，别拿它刷机）；
 > Tab 三台是 BENGAL，仓库里没有对应的 programmer，那条路在它们上走不通。
 """),
 

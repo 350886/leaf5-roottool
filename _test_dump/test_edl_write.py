@@ -315,18 +315,21 @@ def t_backup_short():
 
 
 def t_no_backup():
-    print("[10] --no-backup：跳过备份但仍然读回校验")
+    print("[10] backup=False：必须被拒绝，一个字节都不写")
     src = tmpimg(2048, b"\x77")
-    body = open(src, "rb").read()
 
     def run():
-        FakeSession.script = [body]
+        FakeSession.script = [open(src, "rb").read()]
         out = tempfile.mkdtemp()
-        r = edlman.write_partition("fake.bin", "boot_b", src, bak_dir=out,
+        try:
+            edlman.write_partition("fake.bin", "boot_b", src, bak_dir=out,
                                    log=None, backup=False, verify=True)
-        chk(r["backup"] == "", "没有备份路径")
-        chk(r["verified"] is True, "读回校验照样做")
-        chk(len(FakeSession.writes) == 1, "只写一次")
+            chk(False, "backup=False 应该被拒绝，实际写进去了")
+        except edlman.EdlError as e:
+            chk("必须备份" in str(e),
+                "错误点明了必须备份：%s" % str(e)[:50])
+            chk("未写入任何字节" in str(e), "声明了没有写入")
+        chk(FakeSession.writes == [], "一次写都没发出去")
 
     with_fake_session(run)
     os.remove(src)

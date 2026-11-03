@@ -56,13 +56,23 @@ def _loader_dirs():
 
 def loader_candidates():
     """
-    firehose programmer。lito 平台两个都留：
-      lito_op_n10_fhprg.bin   OnePlus N10（SM6350，实测通过的那份，排第一）
-      lito_moto_fhprg.bin     摩托罗拉同平台，互为备份
+    firehose programmer。lito 平台两个都留，**moto 版排第一**：
+
+      lito_moto_fhprg.bin     功能完整：configure 自报 MaxPayload=1048576，
+                              二进制里没有 Device verified failed / fm / ato
+                              那套校验字符串。2026-11-03 实测 96MB 写入 3.92s。
+      lito_op_n10_fhprg.bin   OnePlus N10 定制件，**受限构建**：
+                              MaxPayload 只有 16384，program 一律回
+                              "ERROR: fm=0, ato=0 / Device verified failed"
+                              且 rawmode=false。只能读，不能写。
+
+    顺序在这里是有意义的 —— loader_path() 取 ls[0]，排错了默认走的就是
+    那条只能读的路。历史上就是排错了一次：读通路通、写通路全废，
+    排了半天以为是设备锁。
     """
     out = []
     for d in _loader_dirs():
-        for n in ("lito_op_n10_fhprg.bin", "lito_moto_fhprg.bin"):
+        for n in ("lito_moto_fhprg.bin", "lito_op_n10_fhprg.bin"):
             p = os.path.join(d, n)
             if os.path.isfile(p) and p not in out:
                 out.append(p)
@@ -732,6 +742,7 @@ class Session:
 
         self.options["<partitionname>"] = part
         self.options["<filename>"] = image_path
+        self._drop_bogus_vendor()
 
         def fn():
             with Session._Route(on_line, on_progress):
@@ -743,6 +754,42 @@ class Session:
         if rc is None and code:
             raise EdlError("写 %s 中断（SystemExit rc=%s）" % (part, code))
         return dict(partition=part, size=size, sectors=need, seconds=dt)
+
+    def _drop_bogus_vendor(self):
+        """把「认不出机型」的厂商模块摘掉，让写走通用分支。
+
+        为什么会走到这儿：edlclient 的厂商模块是按 programmer 在 configure 阶段
+        自报的 supported_functions 猜的。ONYX 这颗 programmer 报了 setprojmodel，
+        于是被当成一加，构造出 oneplus 实例；而 oneplus.convert_projid() 在
+        deviceconfig 里查不到本机型时，走到
+
+            assert "Unknown projid:" + str(projid)
+            return None
+
+        那句 assert 断言的是**字符串常量**，永远为真，所以它不抛、不打印，静默
+        返回 None。一直拖到 cmd_program 里调 modules.addprogram() →
+        oneplus.addprogram() → self.ops.generatetoken(True) 才炸成
+        `'NoneType' object has no attribute 'generatetoken'`，报错信息里连分区
+        名都没有，看不出跟厂商模块有关。
+
+        好消息是它炸在**发出 program 命令之前**，分区一个字节没动（实测写前
+        写后 sha256 一致）。坏消息是这条路永远写不进去。
+
+        只摘 inner 为 None 的那种 —— 真一加 / 真小米这里是有值的，不受影响。
+        """
+        try:
+            fh = getattr(self.fh, "firehose", None) or self.fh
+            mods = getattr(fh, "modules", None)
+            if mods is None:
+                return
+            # modules.ops 是 oneplus 实例（给个 devicemodel 就建得出来），
+            # 它自己的 .ops 才是 convert_projid 的返回值 —— 认不出就是 None。
+            if getattr(getattr(mods, "ops", None), "ops", None) is None:
+                fh.modules = None
+        except Exception:
+            # 摘不掉也别让写入因此中断：这里只是清一个可选钩子，
+            # 真需要 token 的机型会在 program 命令上被设备自己拒掉。
+            pass
 
     def _drain(self, rounds=256):
         """

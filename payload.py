@@ -565,16 +565,37 @@ class Payload:
             self.path.name, self.version, len(self.manifest.partitions))
 
 
+def _has_payload(p: Path) -> bool:
+    """这个 zip 里到底有没有 payload.bin。
+
+    为什么必须查：自动挑包原来是「目录里最大的 .zip」，结果在 dist/ 下
+    把本工具自己的发布包 Leaf5RootTool_gplay.zip（78MB，比固件还大）
+    当成了固件，读出来报「里没有 payload.bin」—— 用户看到的像是工具坏了。
+    只读 zip 的中央目录，不解压，几百 MB 的包也是毫秒级。
+    """
+    try:
+        with zipfile.ZipFile(p) as z:
+            names = set(z.namelist())
+    except (zipfile.BadZipFile, OSError):
+        return False
+    # 绝大多数 OTA 是根目录的 payload.bin；少数包把整个 payload 套进一层子目录
+    return ("payload.bin" in names
+            or "payload_properties.txt" in names
+            or any(n.endswith("/payload.bin") for n in names))
+
+
 def find_ota(folder: str | Path) -> list[Path]:
     """在目录里找 update.zip，按体积倒序（固件包必然最大）。
 
     只认 .zip：ONYX 下载下来的是 .upx，那是厂商自己的加密容器
     （随机字节开头，没有可识别的魔数），要先解成 zip 才能读。
     把 .upx 也列出来只会让人以为工具坏了。
+
+    并且必须真的带 payload.bin —— 光看扩展名会把发布包/备份包也收进来。
     """
     folder = Path(folder)
     if not folder.is_dir():
         return []
     out = [p for p in folder.iterdir()
-           if p.is_file() and p.suffix.lower() == ".zip"]
+           if p.is_file() and p.suffix.lower() == ".zip" and _has_payload(p)]
     return sorted(out, key=lambda p: p.stat().st_size, reverse=True)

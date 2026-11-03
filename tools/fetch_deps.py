@@ -84,8 +84,8 @@ DEPS = [
              "oneplus/0013f0e100515198_2354228eebcbc203_fhprg_op_n10.bin"),
         dest="assets/lito_op_n10_fhprg.bin",
         sha="6558f49c3a55d0eb7fdd7bb326c9bb22b29f4b6b6316937e847e8b76e11f6ec0",
-        optional=False,
-        note="OnePlus N10 (SM6350/lito) firehose programmer，来自 bkerler/Loaders",
+        optional=True,
+        note="OnePlus N10 (SM6350/lito) firehose programmer，仅能读——受限构建",
     ),
     dict(
         name="fhprg_moto",
@@ -97,8 +97,8 @@ DEPS = [
              "lenovo_motorola/0013f0e102e80000_628be3f403d0c67a_fhprg.bin"),
         dest="assets/lito_moto_fhprg.bin",
         sha="1b5fa0ac18e3ac136aac184bf36d4ef02ad1819ccadc14214b97ce00326e20c1",
-        optional=True,
-        note="Motorola lito（同 HWID 0x13F0E1）firehose programmer，兜底用",
+        optional=False,
+        note="Motorola lito（同 HWID 0x13F0E1）firehose programmer，主用件",
     ),
     dict(
         name="zadig",

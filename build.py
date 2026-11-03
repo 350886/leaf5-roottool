@@ -29,7 +29,7 @@ GP_NAME = "Leaf5RootTool_gplay"
 # 换成自签名证书后，别人从 EXE 里能读到的只有这一个名字，不含公司名/个人信息。
 # 想换：set LEAF5_SIGN_CN=CN=你自己的名字 后跑 --sign，或改这里重新生成证书。
 SIGN_CN = "SWT"
-VERSION = (1, 1, 10, 0)
+VERSION = (1, 1, 12, 0)
 
 # fastboot.exe 和 adb 共用 AdbWinApi.dll / AdbWinUsbApi.dll，一起进 assets/adb。
 # 它只给「fastbootd 刷 boot」用：ONYX 的 abl 裁掉了 bootloader 模式的 flash，
@@ -37,8 +37,11 @@ VERSION = (1, 1, 10, 0)
 ADB = ["adb.exe", "AdbWinApi.dll", "AdbWinUsbApi.dll", "fastboot.exe"]
 PAYLOAD = ["preload.so", "device_root.sh"]
 MAGISK = ["Magisk-v31.1.apk"]
-# firehose programmer：lito 平台。没有它 9008 通路直接断
-LOADERS = ["lito_op_n10_fhprg.bin", "lito_moto_fhprg.bin"]
+# firehose programmer：lito 平台。没有它 9008 通路直接断。
+# moto 排第一 = 主用件：MaxPayload 1MB，program 可用（实测 96MB/3.92s）。
+# op 版是 OnePlus 的受限构建，MaxPayload 只有 16KB 且 program 被
+# Device verified failed 挡死，留着只当读通路备份。
+LOADERS = ["lito_moto_fhprg.bin", "lito_op_n10_fhprg.bin"]
 # Zadig（libwdi）：新机器缺 WinUSB 驱动时自动拉起
 ZADIG = "zadig.exe"
 
@@ -92,6 +95,31 @@ def sync_exploit():
 
     print(f"[*] 同步 exploit 源码 {n} 个文件 → {SRC_DST}")
     return SRC_DST
+
+
+def sync_version():
+    """把 build.py 的 VERSION 回写进 roottool.py 的 APP_VER。
+
+    这个坑踩过：EXE 属性页是 1.1.11.0，日志头和窗口标题却是 1.1.10 ——
+    VERSION 只进了 PyInstaller 的 version-file，从没进过代码。
+    发版后从日志里看版本号会以为装错了包。
+    真相源放这里，编译时回写。
+    """
+    import re
+
+    ver = ".".join(str(x) for x in VERSION[:3])
+    target = os.path.join(HERE, "roottool.py")
+    with open(target, "r", encoding="utf-8") as f:
+        src = f.read()
+    new, n = re.subn(r'(?m)^APP_VER = "[^"]*"$', 'APP_VER = "%s"' % ver,
+                     src, count=1)
+    if n != 1:
+        # 静默跳过就会重现「版本对不上」，这里必须硬失败
+        raise SystemExit("[x] roottool.py 里找不到 APP_VER 行，拒绝继续")
+    if new != src:
+        with open(target, "w", encoding="utf-8") as f:
+            f.write(new)
+        print("[*] 版本同步 roottool.py APP_VER -> %s" % ver)
 
 
 def ver_file(name=None):
@@ -158,6 +186,8 @@ def gp_flag_file():
 def main():
     onedir = "--onedir" in sys.argv
     do_sign = "--sign" in sys.argv
+
+    sync_version()
 
     # 解释器自检：本工具是 tkinter GUI，打包用的解释器没有 tkinter 时
     # PyInstaller 不会失败，会安安静静打出一个 24MB 的坏包 ——
@@ -373,16 +403,31 @@ def sign(exe):
     if not want_cn.upper().startswith("CN="):
         want_cn = "CN=" + want_cn
     cn_lit = want_cn.replace("'", "''")  # PowerShell 单引号串内转义
+    # 为什么不用 Get-ChildItem Cert:\CurrentUser\My -CodeSigningCert：
+    # 那两样都是「Certificate provider」提供的（-CodeSigningCert 是动态参数，
+    # Cert: 是驱动器），而 provider 要 Microsoft.PowerShell.Security 模块才能挂上。
+    # 这台机器的 PSModulePath 里混进了 PowerShell 7 的模块目录，5.1 子进程
+    # 加载不到自己的 Security 模块 → 报「找不到驱动器 Cert」/「找不到参数
+    # CodeSigningCert」→ stdout 空 → 被当成「证书库里没证书」→ 静默跳过签名。
+    # 直接走 .NET X509Store，不依赖任何 provider/module。
+    #
+    # encoding 也要钉死 utf-8 + 强制 OutputEncoding：中文 Windows 上
+    # PowerShell 默认吐 GBK，subprocess text=True 按 locale 解会抛
+    # UnicodeDecodeError，同样把异常吞成「没证书」。
     ps = (
-        "$all = Get-ChildItem Cert:\\CurrentUser\\My -CodeSigningCert "
-        "| Where-Object { $_.HasPrivateKey }; "
-        f"$t = $all | Where-Object {{ $_.Subject -eq '{cn_lit}' }} | Select-Object -First 1; "
+        "[Console]::OutputEncoding=[Text.Encoding]::UTF8; "
+        "$s=[System.Security.Cryptography.X509Certificates.X509Store]::new('My','CurrentUser'); "
+        "$s.Open('ReadOnly'); "
+        "$all=@($s.Certificates | Where-Object { $_.HasPrivateKey }); "
+        f"$t=$all | Where-Object {{ $_.Subject -eq '{cn_lit}' }} | Select-Object -First 1; "
         "if (-not $t) { $t = $all | Select-Object -First 1 }; "
-        "if ($t) { $t.Subject + '|' + $t.Thumbprint }"
+        "if ($t) { $t.Subject + '|' + $t.Thumbprint }; "
+        "$s.Close()"
     )
     try:
         p = subprocess.run(["powershell", "-NoProfile", "-Command", ps],
-                           capture_output=True, text=True, timeout=60)
+                           capture_output=True, text=True,
+                           encoding="utf-8", errors="replace", timeout=60)
         out = (p.stdout or "").strip()
     except Exception:
         out = ""
@@ -398,7 +443,8 @@ def sign(exe):
     cmd = (f"& '{signtool}' sign /sha1 {thumb} /fd SHA256 /tr http://timestamp.digicert.com "
            f"/td SHA256 '{exe}'")
     r = subprocess.run(["powershell", "-NoProfile", "-Command", cmd],
-                       capture_output=True, text=True, timeout=180)
+                       capture_output=True, text=True,
+                       encoding="utf-8", errors="replace", timeout=180)
     print(r.stdout.strip() or r.stderr.strip())
     if r.returncode == 0:
         print("[+] 已签名")

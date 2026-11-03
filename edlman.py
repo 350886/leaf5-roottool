@@ -402,6 +402,16 @@ def write_partition(loader, name, image, bak_dir=None, log=None,
         if log:
             log(x)
 
+    # 备份不是可选项。`--no-backup` 这个入口留着只为不让老脚本报
+    # "unrecognized arguments"，真传进来在这里就断掉：刷坏的 boot 是这台
+    # 机器上唯一不能自救的分区，而跳过备份的那次操作往往会被写进脚本、
+    # 变成下次的默认行为。
+    if not backup:
+        raise EdlError(
+            "写分区之前必须备份原分区，已取消（未写入任何字节）。\n"
+            "  --no-backup 已停用：没有原分区备份，boot 刷坏只能整机重刷。\n"
+            "  确实要跳过请用 --dry-run 先看计划，或用 bkerler/edl 这类底层工具。")
+
     image = os.path.abspath(image)
     if not os.path.isfile(image):
         raise EdlError("镜像不存在：%s" % image)
@@ -561,7 +571,7 @@ def dump_boot(out_dir, prefer_slot=None, log=None, env=None, serial=None,
     loader = find_loader()
     if not loader:
         raise EdlError("找不到 firehose programmer（*_fhprg.bin）。\n"
-                       "  正常安装包里 assets\\ 下应该有 lito_op_n10_fhprg.bin")
+                       "  正常安装包里 assets\\ 下应该有 lito_moto_fhprg.bin")
     say("  " + env_report())
 
     os.makedirs(out_dir, exist_ok=True)
@@ -755,7 +765,7 @@ def _cli():
     a6.add_argument("image", help="要写入的镜像")
     a6.add_argument("-o", "--out", default=None, help="备份目录（默认 <工具目录>/work）")
     a6.add_argument("--no-backup", action="store_true",
-                    help="不备份原分区（出事无法回滚，不建议）")
+                    help="（已停用）刷前备份关不掉；传了会直接拒绝")
     a6.add_argument("--no-verify", action="store_true", help="写完不读回校验")
     a6.add_argument("--yes", action="store_true",
                     help="确认执行（不给就只打印计划，一个字节不写）")
@@ -804,19 +814,23 @@ def _cli():
             if not os.path.isfile(src):
                 print("[X] 镜像不存在：%s" % src)
                 return 2
+            if a.no_backup:
+                print("[X] 刷前备份无法关闭：--no-backup 已停用，命令取消"
+                      "（未动设备）。")
+                print("    boot 分区刷坏只能整机重刷，写之前那份原分区是唯一的退路。")
+                return 2
             size = os.path.getsize(src)
             print("准备写入")
             print("  分区  : %s" % a.part)
             print("  镜像  : %s（%d 字节）" % (src, size))
             print("  sha256: %s" % sha256_of(src))
-            print("  备份  : %s" % ("不备份" if a.no_backup
-                                     else (a.out or os.path.join(_tool_root(), "work"))))
+            print("  备份  : %s" % (a.out or os.path.join(_tool_root(), "work")))
             print("  校验  : %s" % ("跳过" if a.no_verify else "写完读回比对 sha256"))
             if not a.yes:
                 print("\n未执行。确认无误后加 --yes 重跑本命令。")
                 return 0
             r = write_partition(find_loader(), a.part, src, bak_dir=a.out,
-                                log=print, backup=not a.no_backup,
+                                log=print, backup=True,
                                 verify=not a.no_verify,
                                 allow_driver=not a.no_driver)
             print("\n写入 %s 完成：%d 字节" % (r["partition"], r["size"]))

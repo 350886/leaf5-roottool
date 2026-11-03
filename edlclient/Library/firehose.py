@@ -20,6 +20,11 @@ from edlclient.Library.sparse import QCSparse
 from edlclient.Library.utils import *
 from edlclient.Library.utils import progress
 
+# 一条 firehose 命令最多等多久。原实现是无限等（cdc.read(timeout=None)），
+# 设备不回 <response> 就永久挂住。30 秒对正常命令绰绰有余 —— 96MB 的
+# <read> 命令也是先回 ACK 再流数据，ACK 本身是毫秒级的。
+XML_ACK_TIMEOUT = 30.0
+
 
 def writedata(filename, rq, append=False):
     pos = 0
@@ -33,6 +38,22 @@ def writedata(filename, rq, append=False):
             pos += len(data)
             wf.write(data)
             rq.task_done()
+
+
+def _resp_complete(buf):
+    """判断缓冲区里的 <response .../> 是否收完整。
+
+    原实现的循环条件是 `b"<response value" not in rdata` —— 只要看到标签开头就退出，
+    USB 分包时后半段属性（rawmode="true" / TargetName 等）会被直接丢掉。
+    实测后果：<program> 的 ACK 只剩 {"value": "ACK"}，rawmode 字段消失，
+    被误判成「设备没进 raw 接收态」从而放弃写入。
+    """
+    raw = bytes(buf)
+    i = raw.rfind(b"<response value")
+    if i < 0:
+        return False
+    tail = raw[i:]
+    return b"/>" in tail or b"</response>" in tail
 
 
 class response:
@@ -271,18 +292,44 @@ class firehose(metaclass=LogBase):
         counter = 0
         timeout = 3
         if not skipresponse:
-            while b"<response value" not in rdata:
+            # 原实现是 cdc.read(timeout=None) —— pyusb 收到 None 就**无限等**，
+            # 设备不回 <response> 时整条会话永久挂住（实测发 <program> 之后
+            # 卡了 7 分钟没有任何动静，只能人工杀进程，而且因为没有 reset，
+            # 设备留在 9008 里）。下面两道闸：
+            #   1. 每次 read 只等 2 秒，让循环有机会检查总时长；
+            #   2. 总时长超过 XML_ACK_TIMEOUT 就认输，交回 resp=False。
+            # 交回 False 而不是抛异常，是为了让上层的 write_partition 走
+            # 「写失败 → 回滚」这条已经写好的路。
+            deadline = time.time() + XML_ACK_TIMEOUT
+            idle = 0
+            while not _resp_complete(rdata):
+                if time.time() > deadline:
+                    self.error("等设备响应超过 %d 秒，放弃（设备可能不支持该命令）"
+                               % int(XML_ACK_TIMEOUT))
+                    # data 必须是 dict、error 必须是 list：configure() 里有
+                    # `for line in rsp.error` 和 `"MemoryName" in rsp.data`，
+                    # 给 b"" 会抛 TypeError（a bytes-like object is required），
+                    # 给 str 会把错误信息逐字符迭代一遍。
+                    return response(resp=False, error=["ack timeout"], data={})
                 try:
-                    tmp = self.cdc.read(timeout=None)
-                    if tmp == b"" in rdata:
-                        counter += 1
-                        time.sleep(0.05)
-                        if counter > timeout:
-                            break
-                    rdata += tmp
+                    tmp = self.cdc.read(timeout=500)
+                    if tmp == b"":
+                        # 已经拿到 <response ... 但标签还没闭合：可能是 USB 分包，
+                        # 后半段（rawmode / TargetName 等属性）还在路上。
+                        # 再给几次机会，连续 3 次（约 1.5 秒）没新数据才放弃。
+                        idle += 1
+                        if idle >= 3:
+                            if rdata:
+                                break
+                            counter += 1
+                            if counter > timeout:
+                                break
+                    else:
+                        idle = 0
+                        rdata += tmp
                 except Exception as err:
                     self.error(err)
-                    return response(resp=False, error=str(err))
+                    return response(resp=False, error=[str(err)], data={})
             try:
                 if b"raw hex token" in rdata:
                     rdata = rdata
@@ -960,6 +1007,12 @@ class firehose(metaclass=LogBase):
                     self.cfg.TargetName = rsp.data["TargetName"]
                 return self.configure(lvl + 1)
             for line in rsp.error:
+                if "ack timeout" in line:
+                    # 设备在会话中途彻底不出声（拔线、死机、或被拒后停在 raw 等待态）。
+                    # 继续往下走 parse_storage() 只会连环失败并且日志全是噪音，
+                    # 直接交回 False，让调用方走 reset/放弃。
+                    self.error("configure 无响应，会话作废")
+                    return False
                 if "Not support configure MemoryName eMMC" in line:
                     self.info("eMMC is not supported by the firehose loader. Trying UFS instead.")
                     self.cfg.MemoryName = "UFS"

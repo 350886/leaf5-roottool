@@ -55,7 +55,7 @@ except ImportError:  # 精简版 Python 可能没带 tcl/tk
 # ----------------------------------------------------------------------------
 
 APP_NAME = "Leaf5 Root Tool"
-APP_VER = "1.1.10"
+APP_VER = "1.1.12"
 
 # 本工具适配的唯一目标。写在界面上、写进日志、拿来卡住别的机型。
 # 62 个偏移 + services.jar 补丁点全部绑死在这个三元组上，换任何一个都不成立。
@@ -88,8 +88,13 @@ CHAIN_ENV = (
     "PSELECT_ROUTE_ATTEMPTS=2 PAGE_SETUP_ATTEMPTS=1 MM_SPRAY_SLABS=0"
 )
 
-# 本机 adb server 用独立端口，避免跟 Android Studio / 别的工具抢 5037
-DEFAULT_PORT = 5053
+# 必须是 5037。这里曾经用 5053「避免跟 Android Studio 抢端口」，实测是错的：
+# Windows 上 USB 设备句柄被**先起来的那个** adb server 独占，换端口起的
+# 新 server 拿不到设备，`adb devices` 永远返回空表 —— 表现为「设备插着、
+# 驱动正常、工具说不存在」。只要系统里有任何一个标准 server 在跑
+# （Android Studio、手机助手、本工具上次留下的孤儿进程）就必然踩中。
+# 端口要换只能用 --port 显式指定，且要先 kill-server 掉旧的。
+DEFAULT_PORT = 5037
 
 # ---- Magisk 集成 ----------------------------------------------------------
 MAGISK_VER = "31.1"
@@ -197,6 +202,76 @@ def backup_dir():
     d = os.path.join(app_data_dir(), "backup")
     os.makedirs(d, exist_ok=True)
     return d
+
+
+# 备份文件小于这个尺寸肯定不是真的 boot 分区留下的（dd 读失败会留短文件）
+_MIN_BACKUP_BYTES = 1 << 20
+
+
+def backup_partition(adb, part, out_root=None, log=None):
+    """把分区 dd 出来并拉回 PC，返回本地路径。
+
+    任何一步不成立都抛 RuntimeError —— 包括「没有 root」。
+
+    为什么不做成「备份失败就警告一下继续刷」：刷坏 boot 是这台机器上唯一
+    不能自救的分区，没有原厂镜像就只能整机重刷。备份只要几十秒到几分钟，
+    而一个 0 字节的「备份」比没有备份更糟：它让人以为有退路。
+
+    fastbootd 那条路也用这个：备份必须在 `adb reboot fastboot` **之前**做，
+    进去以后 adb 就断了，读不了块设备。
+    """
+    def say(x):
+        if log:
+            log(x)
+
+    out_root = out_root or backup_dir()
+    remote = "/data/local/tmp/boox_stock.img"
+    blk = "/dev/block/by-name/%s" % part
+
+    # 1) 有 su 才读得到块设备
+    try:
+        who = adb.shell("su -c id", timeout=15)
+    except Exception as e:
+        raise RuntimeError("确认 root 失败（%s），无法备份 %s —— 不备份就不刷"
+                           % (e, part))
+    if "uid=0" not in (who or ""):
+        raise RuntimeError(
+            "没有 root，读不到 %s，备份做不出来 —— 已取消（分区未改动）\n"
+            "  换一条能备份的路：先拿 root，或用「EDL 刷 boot」"
+            "（9008 会先读一份原分区再写）" % part)
+
+    # 2) dd 到 /data/local/tmp
+    say("  备份 %s → 设备内 %s" % (part, remote))
+    try:
+        out = adb.shell("su -c 'dd if=%s of=%s bs=1048576 2>&1; echo RC=$?'"
+                        % (blk, remote), timeout=300)
+    except Exception as e:
+        raise RuntimeError("dd 备份失败：%s" % e)
+    if "RC=0" not in (out or ""):
+        raise RuntimeError("dd 备份失败：%s" % ((out or "无输出")[-300:]))
+
+    # 3) 拉回 PC
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    local = os.path.join(out_root, "stock_%s_%s.img" % (part, stamp))
+    say("  拉回 PC → %s" % local)
+    try:
+        adb.pull(remote, local, timeout=900)
+    except Exception as e:
+        raise RuntimeError("备份拉回失败：%s" % e)
+    finally:
+        try:
+            adb.shell("su -c 'rm -f %s'" % remote, timeout=15)
+        except Exception:
+            pass
+
+    if not os.path.isfile(local):
+        raise RuntimeError("备份文件没落地：%s —— 已取消" % local)
+    got = os.path.getsize(local)
+    if got < _MIN_BACKUP_BYTES:
+        raise RuntimeError("备份只有 %d 字节，不像完整分区 —— 已取消" % got)
+    say("  备份完成 %.1f MB  md5 %s"
+        % (got / 1048576.0, md5_of(local)))
+    return local
 
 
 # ----------------------------------------------------------------------------
@@ -2745,8 +2820,10 @@ class App:
         if not messagebox.askyesno(
                 "确认用 fastbootd 写 boot",
                 "目标分区：%s\n镜像：%s\n大小：%.1f MB\n\n"
-                "顺序：重启进 fastbootd → 写入 → 重启回系统。\n"
-                "这条通路不需要 root，但需要 bootloader 已解锁。\n\n继续？"
+                "顺序：备份原分区 → 重启进 fastbootd → 写入 → 重启回系统。\n"
+                "这条通路不需要 root，但需要 bootloader 已解锁。\n\n"
+                "备份要读到块设备，所以本机必须有 root；没有就中止，不会写。\n\n"
+                "继续？"
                 % (part, os.path.basename(path), size / 1048576.0)):
             return
 
@@ -2762,6 +2839,17 @@ class App:
             fb = fbdlink.Fastboot(exe, serial=self.adb.serial, log=qlog)
             fd = fbdlink.Fastbootd(self.adb, fb, log=qlog)
             try:
+                # 备份必须在 enter() 之前：进了 fastbootd，adb 就断了，
+                # 读不了块设备。这一步不过就不往下走 —— 没有原分区，
+                # 刷坏了这条通路没有任何回滚手段。
+                self.q.put(("log", "  刷前备份（这条通路以前完全没有备份）…"))
+                try:
+                    bak = backup_partition(self.adb, part, log=qlog)
+                except RuntimeError as e:
+                    raise fbdlink.FastbootError(
+                        "刷前备份失败，已中止（分区未改动）：\n%s" % e)
+                self.q.put(("log", "  备份：%s" % bak))
+
                 ok, how = fd.enter()
                 if not ok:
                     raise fbdlink.FastbootError(
@@ -2791,8 +2879,9 @@ class App:
                 messagebox.showinfo(
                     "fastbootd 刷 boot 完成",
                     "已写入 %s，设备正在重启。\n\n"
+                    "原分区备份：%s\n"
                     "开机后如果没看到 Magisk，先确认 App 已装好，"
-                    "再查这份镜像本身是否真的打过补丁。" % part)))
+                    "再查这份镜像本身是否真的打过补丁。" % (part, bak))))
 
         threading.Thread(target=job, daemon=True).start()
 

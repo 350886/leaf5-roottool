@@ -58,3 +58,11 @@ _test_dump/build/
 _test_dump/*.img
 _test_dump/*.txt
 _test_dump/mock_*.py
+
+# ── 运行时状态，不是源码 ────────────────────────────────────────────
+# work/ 是刷机时落的分区镜像（一份 stock_boot_b.img 就 96 MB），随时可由设备重读。
+# edl_config.json 由 firehose.py 在每次连上 9008 后重写：programmer 路径 + 设备
+# serial。它记的是「上次连的是哪台机」，进了仓库就是每次跑工具都脏一次，
+# 而且在公开仓库里带真实 serial 没有意义。
+work/
+edl_config.json
