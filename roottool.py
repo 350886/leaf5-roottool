@@ -41,11 +41,13 @@ try:
     from tkinter import ttk
     from tkinter import messagebox
     from tkinter import filedialog
+    from thinbar import ThinBar
 except ImportError:  # 精简版 Python 可能没带 tcl/tk
     tk = None
     ttk = None
     messagebox = None
     filedialog = None
+    ThinBar = None
 
 # ----------------------------------------------------------------------------
 # 常量：设备端布局与已验证的 chain 配置
@@ -53,7 +55,7 @@ except ImportError:  # 精简版 Python 可能没带 tcl/tk
 # ----------------------------------------------------------------------------
 
 APP_NAME = "Leaf5 Root Tool"
-APP_VER = "1.1.9"
+APP_VER = "1.1.10"
 
 # 本工具适配的唯一目标。写在界面上、写进日志、拿来卡住别的机型。
 # 62 个偏移 + services.jar 补丁点全部绑死在这个三元组上，换任何一个都不成立。
@@ -1696,13 +1698,16 @@ class App:
         # 多了一行「要刷 boot？」（两个按钮 + 两行说明 ≈ 86px）。
         # 屏幕不够就压回屏幕内 —— 否则底部日志区整个跑到屏幕外，用户看不到
         # 任何一步的输出，而日志是本工具唯一的事后证据。
-        _h = 966 if GP_ENABLED else 936
+        # 高度不再按操作区内容撑。五组选项 + 每项两行「用在什么情况」堆到 966：
+        # 1080 屏上贴着任务栏，1366×768 上直接超出 —— 底部日志被任务栏盖住。
+        # 现在给固定上限，装不下就在视口里滚（见 _build 里的 canvas）。
+        _h = 760
         try:
-            _h = min(_h, root.winfo_screenheight() - 60)
+            _h = max(620, min(_h, root.winfo_screenheight() - 120))
         except Exception:
             pass
         root.geometry("900x%d" % _h)
-        root.minsize(780, 580)
+        root.minsize(780, 620)
         root.configure(bg=BG)
 
         self._build()
@@ -1720,8 +1725,48 @@ class App:
     def _build(self):
         pad = {"padx": 12, "pady": 6}
 
+        # -- 滚动视口 ------------------------------------------------------
+        # 上面四块（设备行 / 状态行 / 操作区）加起来 470px，窗口压到 760 就装
+        # 不下了。它们放进 canvas 里滚，下面的进度条、日志、底栏固定 ——
+        # 日志是唯一的事后证据，不能跟着滚出视野。
+        self.root.grid_columnconfigure(0, weight=1)
+        self.root.grid_rowconfigure(0, weight=0)                 # 视口
+        self.root.grid_rowconfigure(1, weight=0)                 # 进度条
+        self.root.grid_rowconfigure(2, weight=1, minsize=180)    # 日志
+        self.root.grid_rowconfigure(3, weight=0)                 # 底栏
+
+        self._view = tk.Frame(self.root, bg=BG)
+        self._view.grid(row=0, column=0, sticky="nsew")
+
+        self._cv_h = 0
+        self._cv = tk.Canvas(self._view, bg=BG, highlightthickness=0, bd=0,
+                             height=470)
+        # 不用 ttk.Scrollbar：vista 主题下 width 被接管，画出来是 17px 的浅灰
+        # 块；tk.Scrollbar 的 trough 颜色同样只在经典主题生效。自绘见 thinbar.py。
+        self._bar = ThinBar(self._view, command=self._cv.yview,
+                            target=self._cv, trough="#242424", thumb="#55595f",
+                            hover="#6c7178", offtrack="#1e1e1e", bg=BG)
+        self._cv.configure(yscrollcommand=self._bar.set)
+        self._bar.pack(side="right", fill="y")
+        self._cv.pack(side="left", fill="both", expand=True)
+
+        # 视口里的内容容器。用 canvas.create_window 放进去，它不在
+        # winfo_children() 里（是 item 不是 child widget），所以留了 self._inner。
+        inner = tk.Frame(self._cv, bg=BG)
+        self._inner = inner
+        self._inwin = self._cv.create_window((0, 0), window=inner, anchor="nw")
+        inner.bind("<Configure>", self._on_inner)
+        # canvas 变宽时内容跟着变宽，否则文字会在固定 1px 宽度里换行
+        self._cv.bind("<Configure>",
+                      lambda e: self._cv.itemconfigure(self._inwin, width=e.width))
+        # 滚轮：只有指针落在视口里才滚。不判位置的话在日志区滚轮会同时
+        # 滚视口和日志，两处一起跳。
+        for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            self.root.bind_all(seq, self._on_wheel)
+        self.root.bind("<Configure>", self._fit_view)
+
         # 顶部：设备选择
-        top = tk.Frame(self.root, bg=BG)
+        top = tk.Frame(inner, bg=BG)
         top.pack(fill="x", **pad)
 
         # 按钮组现在高 92px（按钮 + 两行说明），顶栏跟着变高。
@@ -1738,7 +1783,7 @@ class App:
         g.pack(side="left")
 
         # 状态行
-        st = tk.Frame(self.root, bg=BG)
+        st = tk.Frame(inner, bg=BG)
         st.pack(fill="x", padx=12)
         tk.Label(st, text="状态", bg=BG, fg=FG, font=("Microsoft YaHei UI", 9)).pack(side="left")
         self.lbl_status = tk.Label(st, text="初始化…", bg=BG, fg=FG_DIM,
@@ -1746,7 +1791,7 @@ class App:
         self.lbl_status.pack(side="left", padx=8, fill="x", expand=True)
 
         # 操作区
-        act = tk.Frame(self.root, bg=BG2, highlightthickness=0)
+        act = tk.Frame(inner, bg=BG2, highlightthickness=0)
         act.pack(fill="x", padx=12, pady=8)
 
         row = tk.Frame(act, bg=BG2)
@@ -1970,14 +2015,14 @@ class App:
 
         # 进度条。日志区是 expand=True 的，不给进度条固定高度就会被挤成一条线
         pf = tk.Frame(self.root, bg=BG, height=12)
-        pf.pack(fill="x", padx=12, pady=(6, 2))
+        pf.grid(row=1, column=0, sticky="ew", padx=12, pady=(6, 2))
         pf.pack_propagate(False)
         self.pb = ttk.Progressbar(pf, mode="determinate", maximum=100)
         self.pb.pack(fill="both", expand=True)
 
         # 日志
         lf = tk.Frame(self.root, bg=BG)
-        lf.pack(fill="both", expand=True, padx=12, pady=8)
+        lf.grid(row=2, column=0, sticky="nsew", padx=12, pady=8)
         self.txt = tk.Text(lf, bg="#141414", fg="#c8c8c8", insertbackground=FG,
                            relief="flat", wrap="none", font=("Consolas", 9),
                            state="disabled", height=18)
@@ -1992,7 +2037,7 @@ class App:
 
         # 底栏
         foot = tk.Frame(self.root, bg=BG)
-        foot.pack(fill="x", padx=12, pady=(0, 8))
+        foot.grid(row=3, column=0, sticky="ew", padx=12, pady=(0, 8))
         # 适用机型放最前面：这行是唯一会跟截图一起传出去的东西，
         # 端口和载荷大小写后面
         self.lbl_foot = tk.Label(
@@ -2001,6 +2046,60 @@ class App:
                   f"   |   adb 端口 {self.port} · 载荷 preload.so 2.4MB"),
             bg=BG, fg=FG_DIM, font=("Microsoft YaHei UI", 8))
         self.lbl_foot.pack(side="left")
+
+    # -- 视口滚动 ------------------------------------------------------------
+
+    def _on_inner(self, _e=None):
+        """内容尺寸变了：更新滚动范围，顺便重算视口高度。
+
+        重算这一步不能省 —— 内容宽度一变，两行说明的换行数就变，内容高
+        跟着变；不重算的话视口会留一块空白或者把最后一行切掉。
+        """
+        try:
+            self._cv.configure(scrollregion=self._cv.bbox("all"))
+        except Exception:
+            pass
+        self._fit_view()
+
+    def _fit_view(self, event=None):
+        """视口高度 = min(内容高, 窗口剩下的空间)。
+
+        canvas 的 height 决定 grid 第 0 行的高度，而窗口高度是用户拖出来的。
+        不在这里算的话只有两种坏结果：内容少时视口虚占一大块空白，或者窗口
+        一压就轮到日志区被挤没 —— 日志是唯一的事后证据。
+
+        固定占用：进度条 12+8、日志最少 180+16、底栏两行约 30、各处 pady。
+        """
+        try:
+            H = self.root.winfo_height()
+            need = self._inner.winfo_reqheight()
+        except Exception:
+            return
+        if H <= 1 or need <= 1:
+            return
+        avail = H - 250
+        h = max(140, min(need, avail))
+        if h != self._cv_h:
+            self._cv_h = h
+            self._cv.configure(height=h)
+
+    def _on_wheel(self, e):
+        """视口滚轮。只在指针落在视口里时滚 —— 不判位置的话，在日志区滚动
+        会同时把上面的选项区滚走，两处一起跳。日志区自己的滚轮由 tk.Text 处理。"""
+        try:
+            px = self.root.winfo_pointerx() - self._view.winfo_rootx()
+            py = self.root.winfo_pointery() - self._view.winfo_rooty()
+            if not (0 <= px <= self._view.winfo_width()
+                    and 0 <= py <= self._view.winfo_height()):
+                return
+        except Exception:
+            return
+        num = getattr(e, "num", 0)
+        if num in (4, 5):
+            step = -3 if num == 4 else 3
+        else:
+            step = -3 if getattr(e, "delta", 0) > 0 else 3
+        self._cv.yview_scroll(step, "units")
 
     # -- 菜单栏 --------------------------------------------------------------
 
@@ -2126,9 +2225,14 @@ class App:
         只写第一行等于把判断留给用户 —— 八个按钮摆一排时，人缺的不是
         功能名，是「我现在这个状态该按哪个」。
 
-        容器尺寸写死（box_w × box_h）并且关掉 pack_propagate：按钮文案长短不一，
-        让容器自己收缩的话每组宽度都不同，下面那行说明的居中基准就跟着乱，
-        看上去像错位。固定尺寸后整行是等宽的格子。
+        宽度写死（box_w）并且关掉 pack_propagate：按钮文案长短不一，让容器自己
+        收缩的话每组宽度都不同，下面那行说明的居中基准就跟着乱，看上去像错位。
+        固定宽度后整行是等宽的格子。
+
+        **高度不写死**。box_h 只是下限 —— 三块内容是「按钮 + 功能说明 + 使用
+        条件」，后两块按 wraplength 折行，行数取决于文案和字体：写死 92 时
+        「fastbootd 刷 boot」那组要 103（26+38+34+5），条件行被压成一行高再裁掉。
+        这个坑一直存在，只是以前测试里那几组没被 map 出来，等于假通过。
         """
         box = tk.Frame(parent, bg=BG2, width=box_w, height=box_h)
         box.pack_propagate(False)
@@ -2140,10 +2244,16 @@ class App:
         lbl.pack(side="top", fill="x", pady=(3, 0))
         # 第二行再压一档灰并加「用在」前缀：两行同样亮度会糊成一整段，
         # 用户读不出哪句是行为、哪句是触发条件。
-        tk.Label(box, text="用在·" + when, bg=BG2, fg="#7d7d7d",
-                 font=("Microsoft YaHei UI", 7),
-                 wraplength=box_w - 6, justify="center", anchor="n").pack(
-            side="top", fill="x", pady=(2, 0))
+        when_lbl = tk.Label(box, text="用在·" + when, bg=BG2, fg="#7d7d7d",
+                            font=("Microsoft YaHei UI", 7),
+                            wraplength=box_w - 6, justify="center", anchor="n")
+        when_lbl.pack(side="top", fill="x", pady=(2, 0))
+        # reqheight 在 pack 之后就能拿到，不用 update_idletasks（那会触发一次
+        # 全局重排，十个按钮建完等于重排十次）。+5 是两个 pady：3 + 2。
+        need = (b.winfo_reqheight() + lbl.winfo_reqheight()
+                + when_lbl.winfo_reqheight() + 5)
+        if need > box_h:
+            box.configure(height=need)
         return box, b, lbl
 
     def _opt_group(self, parent, make, hint, when="", wrap=210):
