@@ -18,6 +18,7 @@ Leaf5 Root Tool — 集成 adb 的一键 root 客户端
 import os
 import re
 import sys
+import json
 import struct
 import time
 import queue
@@ -55,7 +56,7 @@ except ImportError:  # 精简版 Python 可能没带 tcl/tk
 # ----------------------------------------------------------------------------
 
 APP_NAME = "Leaf5 Root Tool"
-APP_VER = "1.1.14"
+APP_VER = "1.1.15"
 
 # 本工具适配的唯一目标。写在界面上、写进日志、拿来卡住别的机型。
 # 62 个偏移 + services.jar 补丁点全部绑死在这个三元组上，换任何一个都不成立。
@@ -282,6 +283,385 @@ def backup_partition(adb, part, out_root=None, log=None):
     say("  备份完成 %.1f MB  md5 %s"
         % (got / 1048576.0, md5_of(local)))
     return local
+
+
+# ----------------------------------------------------------------------------
+# 整机固件备份 / 恢复
+#
+# 和上面 backup_partition 的区别：那个是「刷 boot 之前顺手保一份 boot」，
+# 只保一个分区；这里是「把设备现在的固件整体抠下来」，官网不一定有同版本包
+# （Leaf5 这次官方只发 OTA，里面有 payload.bin，要对上版本还得自己解），
+# 刷坏了拿这份逐分区写回去就行。
+#
+# 备份目录格式与 V2（leaf5-toolkit）完全一致：manifest.json + <分区>.img.gz。
+# 两个工具的备份能互相恢复，不用记是哪一版做的。
+# ----------------------------------------------------------------------------
+
+FW_SCHEMA = 1
+FW_DEV_DIR = "/data/local/tmp/_l5fw"
+
+FW_PRESETS = {
+    "boot": ("boot", "init_boot", "vendor_boot", "recovery",
+             "vbmeta", "vbmeta_system", "vbmeta_vendor", "dtbo"),
+    "critical": ("boot", "init_boot", "vendor_boot", "recovery",
+                 "vbmeta", "vbmeta_system", "vbmeta_vendor", "dtbo",
+                 "super", "system", "system_ext", "vendor", "product", "odm",
+                 "misc", "persist", "modem", "lk", "tee"),
+    "all": None,
+}
+
+# 列分区：名字 + 真实块设备 + 字节数。blockdev 被裁时退 /sys/class/block/*/size
+_FW_LIST_SH = (
+    'for p in /dev/block/by-name/*; do '
+    'n=${p##*/}; '
+    'r=$(readlink -f "$p" 2>/dev/null); '
+    's=$(blockdev --getsize64 "$p" 2>/dev/null); '
+    'if [ -z "$s" ] || [ "$s" = "0" ]; then '
+    'b=${r##*/}; '
+    's=$(( $(cat "/sys/class/block/$b/size" 2>/dev/null || echo 0) * 512 )); '
+    'fi; '
+    'echo "$n|$s|$r"; '
+    'done'
+)
+
+
+def fw_require_root(adb):
+    """读写块设备必须要 uid=0；没有就当场停，别等到 dd 报 Permission denied。"""
+    who = ""
+    try:
+        who = adb.shell("su -c id", timeout=20) or ""
+    except Exception as e:
+        raise RuntimeError("确认 root 失败（%s）" % e)
+    if "uid=0" not in who:
+        raise RuntimeError(
+            "没有 root，读不到块设备 —— 已取消（设备未改动）\n"
+            "  先跑一次一键 root，或在 Magisk App → 超级使用者 → 殼層 打开授权")
+
+
+def fw_list_parts(adb):
+    """[(name, dev, size)]，按名字排序。"""
+    out = adb.shell("su -c '%s'" % _FW_LIST_SH, timeout=90) or ""
+    rows = []
+    for line in out.splitlines():
+        bits = line.strip().split("|")
+        if len(bits) < 3 or not bits[0]:
+            continue
+        try:
+            size = int(bits[1])
+        except ValueError:
+            continue
+        if size > 0:
+            rows.append((bits[0], bits[2], size))
+    if not rows:
+        raise RuntimeError("分区表读不出来（/dev/block/by-name/ 是空的？）")
+    return sorted(rows)
+
+
+def fw_pick_parts(all_parts, spec):
+    """把 boot / critical / all / boot_b,super 解析成分区列表。
+
+    预设里的名字按 base、base_a、base_b 展开，同一套预设能用在单槽和 A/B 机上。
+    """
+    spec = (spec or "critical").strip()
+    names = {p[0] for p in all_parts}
+    by_name = {p[0]: p for p in all_parts}
+
+    if spec in FW_PRESETS:
+        group = FW_PRESETS[spec]
+        if group is None:
+            return list(all_parts)
+        picked, seen = [], set()
+        for base in group:
+            for cand in (base, base + "_a", base + "_b"):
+                if cand in names and cand not in seen:
+                    seen.add(cand)
+                    picked.append(by_name[cand])
+        return picked
+
+    want = []
+    for token in spec.replace(" ", "").split(","):
+        if not token:
+            continue
+        if token in names:
+            want.append(token)
+            continue
+        exp = [c for c in (token + "_a", token + "_b") if c in names]
+        if exp:
+            want.extend(exp)
+            continue
+        raise RuntimeError("设备上没有分区 %s（可用：%s）"
+                           % (token, ", ".join(sorted(names))))
+    return [by_name[n] for n in dict.fromkeys(want)]
+
+
+def fw_md5_gz(path):
+    """流式解压算 md5 与字节数，不落盘。"""
+    import gzip as _gzip
+    h = hashlib.md5()
+    n = 0
+    with _gzip.open(path, "rb") as f:
+        while True:
+            b = f.read(1 << 20)
+            if not b:
+                break
+            h.update(b)
+            n += len(b)
+    return h.hexdigest(), n
+
+
+def fw_dump_one(adb, name, dev, size, dest, say):
+    """把一个分区 dd 出来、压缩后拉回 PC，双向 md5 自证。返回 manifest 里的一条。"""
+    remote = "%s/%s.img" % (FW_DEV_DIR, name)
+    say("  %-16s %7.1f MB → 设备内 dd…" % (name, size / 1048576.0))
+    adb.shell("su -c 'mkdir -p %s; chmod 777 %s'" % (FW_DEV_DIR, FW_DEV_DIR),
+              timeout=30)
+
+    cmd = "su -c 'dd if=/dev/block/by-name/%s of=%s bs=4M 2>&1; echo RC=$?'" % (name, remote)
+    out = adb.shell(cmd, timeout=max(300, size // (4 << 20) + 180)) or ""
+    if "RC=0" not in out:
+        raise RuntimeError("dd 备份 %s 失败：%s" % (name, out.strip()[-200:]))
+
+    got = adb._dev_size(remote)
+    if got != size:
+        raise RuntimeError("dd 产物 %d 字节，分区是 %d 字节" % (got, size))
+
+    dev_md5 = (adb.shell("su -c 'md5sum %s'" % remote,
+                         timeout=max(120, size // (1 << 20) + 60)) or "").split()
+    if not dev_md5:
+        raise RuntimeError("读不到设备侧 md5（%s）" % name)
+    dev_md5 = dev_md5[0]
+
+    gzr = remote + ".gz"
+    adb.shell('su -c "gzip -1 -c %s > %s && chmod 644 %s"' % (remote, gzr, gzr),
+              timeout=max(300, size // (1 << 20) + 120))
+    gzs = adb._dev_size(gzr)
+    if gzs < 1024:
+        raise RuntimeError("压缩包只有 %d 字节，gzip 没读到输入" % gzs)
+
+    local_gz = os.path.join(dest, "%s.img.gz" % name)
+    adb.pull(gzr, local_gz, expect_size=gzs)
+    local_md5, local_size = fw_md5_gz(local_gz)
+    if local_size != size:
+        raise RuntimeError("%s 解压后 %d 字节，分区是 %d" % (name, local_size, size))
+    if local_md5 != dev_md5:
+        raise RuntimeError("%s 校验失败：设备 %s != 本地 %s"
+                           % (name, dev_md5[:12], local_md5[:12]))
+    adb.shell("su -c 'rm -f %s %s'" % (gzr, remote), timeout=30)
+    say("  %-16s %7.1f MB  md5 %s" % (name, size / 1048576.0, local_md5[:12]))
+    return {"name": name, "dev": dev, "size": size, "md5": local_md5,
+            "file": os.path.basename(local_gz), "file_size": gzs, "gz": True}
+
+
+def fw_backup(adb, spec="critical", out_root=None, log=None):
+    """备份指定分区，返回备份目录。"""
+    def say(x):
+        if log:
+            log(x)
+
+    out_root = out_root or backup_dir()
+    fw_require_root(adb)
+    all_parts = fw_list_parts(adb)
+    picked = fw_pick_parts(all_parts, spec)
+    if not picked:
+        raise RuntimeError("按 %s 没匹配到任何分区" % spec)
+
+    total = sum(p[2] for p in picked)
+    say("将备份 %d 个分区，合计 %.1f MB" % (len(picked), total / 1048576.0))
+    for n, d, s in picked:
+        say("  %-18s %8.1f MB  %s" % (n, s / 1048576.0, d))
+
+    model = ""
+    try:
+        model = adb.shell("getprop ro.product.device", timeout=15) or ""
+    except Exception:
+        pass
+    model = (model or "device").strip() or "device"
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    dest = os.path.join(out_root, "l5fw_%s_%s" % (model, stamp))
+    os.makedirs(dest, exist_ok=True)
+
+    entries = []
+    for i, (name, dev, size) in enumerate(picked, 1):
+        say("[%d/%d] %s" % (i, len(picked), name))
+        entries.append(fw_dump_one(adb, name, dev, size, dest, say))
+
+    info = {"model": "", "device": model, "build": "", "android": "",
+            "slot": "", "serial": "", "magisk": ""}
+    for k, prop in (("model", "ro.product.model"), ("build", "ro.build.display.id"),
+                    ("android", "ro.build.version.release"),
+                    ("slot", "ro.boot.slot_suffix"), ("serial", "ro.serialno")):
+        try:
+            info[k] = (adb.shell("getprop %s" % prop, timeout=15) or "").strip()
+        except Exception:
+            pass
+    info["slot"] = info["slot"].lstrip("_")
+    try:
+        info["magisk"] = (adb.shell("su -c 'magisk -v'", timeout=20) or "").strip()
+    except Exception:
+        pass
+
+    manifest = {
+        "schema": FW_SCHEMA,
+        "created": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "device": info,
+        "preset": spec,
+        "parts": entries,
+        "total_bytes": sum(e["size"] for e in entries),
+    }
+    with open(os.path.join(dest, "manifest.json"), "w", encoding="utf-8") as f:
+        json.dump(manifest, f, ensure_ascii=False, indent=2)
+
+    say("备份完成：%s（%d 个分区，%.1f MB）"
+        % (dest, len(entries), manifest["total_bytes"] / 1048576.0))
+    return dest
+
+
+def fw_push_chunked(adb, local, remote, chunk=2 << 20, tries=12):
+    """本地切块 → 逐块 push（设备侧字节数校验）→ 设备侧 cat 合并。
+
+    本地只用一个 blob 反复覆盖：外面有按轮次统计的批量删除保护（阈值 50），
+    一个 96 MB 镜像切 48 块，逐块删文件的下场是恢复跑到一半被拦下。
+    """
+    size = os.path.getsize(local)
+    if size <= chunk:
+        adb.push(local, remote)
+        return
+    n_parts = (size + chunk - 1) // chunk
+    devdir = "%s/_push_%d" % (FW_DEV_DIR, os.getpid())
+    adb.shell("su -c 'rm -rf %s; mkdir -p %s; chmod 777 %s'"
+              % (devdir, devdir, devdir), timeout=30)
+    tmpdir = tempfile.mkdtemp(prefix="l5fw_")
+    blob = os.path.join(tmpdir, "blob")
+    parts = []
+    try:
+        with open(local, "rb") as f:
+            for i in range(n_parts):
+                buf = f.read(chunk)
+                if not buf:
+                    break
+                with open(blob, "wb") as o:
+                    o.write(buf)
+                dst = "%s/part_%04d" % (devdir, i)
+                ok = False
+                for _ in range(tries):
+                    try:
+                        adb.push(blob, dst)
+                    except Exception:
+                        pass
+                    if adb._dev_size(dst) == len(buf):
+                        ok = True
+                        break
+                    time.sleep(3)
+                    adb._reconnect()
+                if not ok:
+                    raise RuntimeError("分块推送失败：第 %d/%d 块" % (i + 1, n_parts))
+                parts.append(dst)
+        cmd = "su -c 'cat %s > %s'" % (" ".join(parts), remote)
+        adb.shell(cmd, timeout=600)
+        if adb._dev_size(remote) != size:
+            raise RuntimeError("合并后设备侧 %d 字节，应为 %d"
+                               % (adb._dev_size(remote), size))
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        try:
+            adb.shell("su -c 'rm -rf %s'" % devdir, timeout=30)
+        except Exception:
+            pass
+
+
+def fw_restore(adb, src, only=None, log=None):
+    """从备份目录逐分区写回。一个分区失败就停，不继续搅乱状态。"""
+    def say(x):
+        if log:
+            log(x)
+
+    src_dir = src if os.path.isdir(src) else os.path.dirname(os.path.abspath(src))
+    mf_path = os.path.join(src_dir, "manifest.json")
+    if not os.path.isfile(mf_path):
+        raise RuntimeError("%s 里没有 manifest.json —— 这不像一份固件备份" % src_dir)
+    with open(mf_path, "r", encoding="utf-8") as f:
+        mf = json.load(f)
+    if mf.get("schema") != FW_SCHEMA:
+        raise RuntimeError("manifest 版本 %s，本工具只认 %d"
+                           % (mf.get("schema"), FW_SCHEMA))
+
+    fw_require_root(adb)
+    all_parts = fw_list_parts(adb)
+    by_name = {p[0]: p for p in all_parts}
+
+    entries = mf["parts"]
+    if only:
+        wanted = {p[0] for p in fw_pick_parts(all_parts, only)}
+        entries = [e for e in entries if e["name"] in wanted]
+        if not entries:
+            raise RuntimeError("备份里没有 %s 这些分区" % only)
+
+    missing = [e["name"] for e in entries if e["name"] not in by_name]
+    if missing:
+        raise RuntimeError("设备上没有这些分区：%s" % ", ".join(missing))
+
+    say("将恢复 %d 个分区 → %s" % (len(entries), src_dir))
+    tmpdir = tempfile.mkdtemp(prefix="l5fw_r_")
+    ok_n = 0
+    try:
+        for i, e in enumerate(entries, 1):
+            name = e["name"]
+            say("[%d/%d] %s" % (i, len(entries), name))
+            f = os.path.join(src_dir, e["file"])
+            if not os.path.isfile(f):
+                raise RuntimeError("缺文件：%s" % f)
+            md5, size = fw_md5_gz(f) if e.get("gz") else (md5_of(f), os.path.getsize(f))
+            if md5 != e["md5"] or size != e["size"]:
+                raise RuntimeError("%s 镜像损坏（md5 %s，应为 %s）"
+                                   % (name, md5[:12], e["md5"][:12]))
+            cur = by_name[name]
+            if size > cur[2]:
+                raise RuntimeError("%s 镜像 %.1f MB，分区只有 %.1f MB"
+                                   % (name, size / 1048576.0, cur[2] / 1048576.0))
+
+            # 写之前把当前内容存一份：选错镜像时还有退路
+            sdir = os.path.join(src_dir, "_safety_" + time.strftime("%Y%m%d_%H%M%S"))
+            os.makedirs(sdir, exist_ok=True)
+            say("  %s 先备份当前内容…" % name)
+            fw_dump_one(adb, name, cur[1], cur[2], sdir, say)
+
+            local_img = os.path.join(tmpdir, "%s.img" % name)
+            if e.get("gz"):
+                import gzip as _gzip
+                with _gzip.open(f, "rb") as s, open(local_img, "wb") as o:
+                    shutil.copyfileobj(s, o, 1 << 20)
+            else:
+                shutil.copyfile(f, local_img)
+
+            remote = "%s/%s.img" % (FW_DEV_DIR, name)
+            adb.shell("su -c 'mkdir -p %s; chmod 777 %s'" % (FW_DEV_DIR, FW_DEV_DIR),
+                      timeout=30)
+            say("  %s 推送 %.1f MB…" % (name, size / 1048576.0))
+            fw_push_chunked(adb, local_img, remote)
+
+            say("  %s 写回 %s…" % (name, cur[1]))
+            out = adb.shell("su -c 'dd if=%s of=/dev/block/by-name/%s bs=4M conv=fsync 2>&1; "
+                            "echo RC=$?'" % (remote, name),
+                            timeout=max(300, size // (4 << 20) + 180)) or ""
+            if "RC=0" not in out:
+                raise RuntimeError("写入 %s 失败：%s" % (name, out.strip()[-200:]))
+            back = (adb.shell("su -c 'md5sum /dev/block/by-name/%s'" % name,
+                              timeout=max(120, size // (1 << 20) + 60)) or "").split()
+            if not back or back[0] != e["md5"]:
+                raise RuntimeError("%s 回读 md5 不符（%s != %s）"
+                                   % (name, (back or [""])[0][:12], e["md5"][:12]))
+            adb.shell("su -c 'rm -f %s'" % remote, timeout=30)
+            try:
+                os.remove(local_img)
+            except OSError:
+                pass
+            ok_n += 1
+            say("  %s 写入并回读校验通过" % name)
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+    say("恢复完成：%d/%d 个分区。重启后生效。" % (ok_n, len(entries)))
+    return ok_n
 
 
 # ----------------------------------------------------------------------------
@@ -2092,6 +2472,32 @@ def cli_main(args):
         emit(f"[=] {r['stage']}: {r['detail']}")
         return 0 if r.get("ok") else 1
 
+    if args.fw_list or args.backup_fw or args.restore_fw:
+        try:
+            if args.fw_list:
+                for n, d, s in fw_list_parts(adb):
+                    emit("%-22s %8.1f MB  %s" % (n, s / 1048576.0, d))
+                return 0
+            if args.backup_fw:
+                out = fw_backup(adb, args.backup_fw, args.fw_out,
+                                log=lambda s: emit(s))
+                emit("[+] 备份目录：%s" % out)
+                emit('    恢复：%s --restore-fw "%s"'
+                     % (os.path.basename(sys.argv[0]), out))
+                return 0
+            n = fw_restore(adb, args.restore_fw, args.fw_part,
+                           log=lambda s: emit(s))
+            emit("[+] 已恢复 %d 个分区，重启后生效：adb reboot" % n)
+            return 0
+        except RuntimeError as e:
+            emit("[-] %s" % e)
+            return 1
+        finally:
+            try:
+                logf.flush()
+            except Exception:
+                pass
+
     if args.grant_list or args.grant or args.revoke:
         try:
             su = su_probe(adb)
@@ -3758,6 +4164,18 @@ def main():
                     help="从授权表里删掉（收回 root）")
     ap.add_argument("--grant-list", action="store_true",
                     help="只打印当前授权表，不改动")
+    ap.add_argument("--fw-list", action="store_true",
+                    help="列出设备分区（名字 / 大小 / 块设备），只读")
+    ap.add_argument("--backup-fw", nargs="?", const="critical", default=None,
+                    metavar="SPEC",
+                    help="备份设备固件：boot / critical / all，或逗号分隔的分区名。"
+                         "默认 critical = 启动链 + 系统链（不含 userdata）")
+    ap.add_argument("--restore-fw", default=None, metavar="DIR",
+                    help="从备份目录逐分区写回（写前自动再备份目标分区）")
+    ap.add_argument("--fw-out", default=None, metavar="DIR",
+                    help="固件备份放哪，默认 %%LOCALAPPDATA%%\\Leaf5RootTool\\backup")
+    ap.add_argument("--fw-part", default=None, metavar="SPEC",
+                    help="恢复时只写这些分区（默认写备份里的全部）")
     ap.add_argument("--auto", action="store_true",
                     help="全自动：等设备 → 匹配载荷 → 失败自动适配 → （带 --magisk）装 Magisk")
     ap.add_argument("--no-edl", action="store_true",
@@ -3852,9 +4270,12 @@ def main():
     # --grant / --revoke / --grant-list 是纯 CLI 动作，不该因为没 tk 就走 GUI 分支。
     # --magisk / --module 同理：它们带的是「刷 boot 并重启」这种长动作，
     # 走 GUI 只会弹个窗口什么都不显示（实测），必须留在 CLI。
+    # --backup-fw / --restore-fw / --fw-list 是纯 CLI 动作：备份可能跑十几分钟，
+    # 走 GUI 只会弹个空窗口（实测），必须留在控制台。
     if (args.check or args.root or args.auto or args.gplay
             or args.grant or args.revoke or args.grant_list
-            or args.magisk or args.module):
+            or args.magisk or args.module
+            or args.backup_fw or args.restore_fw or args.fw_list):
         attach_console()
         return cli_main(args)
     return gui_main(args.port)

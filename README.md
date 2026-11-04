@@ -204,6 +204,44 @@ adb shell su -c "cp /system/framework/services.jar /data/local/tmp/s.jar"
 
 所以别把闸门当授权书。先跑 `--check`，自己看 model 和 `uname -r` 两个值。
 
+### 先备份设备现在的固件（刷坏了能退回去）
+
+官网只发 OTA 全量包，版本不一定对得上你手上这台（跨版本升过级、刷过 beta、机器比包新）。
+所以刷之前先把当前固件整体抠一份下来 —— 这份是「只有你有」的，官网没有。
+
+```bash
+Leaf5RootTool.exe --fw-list                     # 只读：列分区名 / 大小 / 块设备
+Leaf5RootTool.exe --backup-fw boot              # 启动链（boot/recovery/vbmeta/dtbo），约 5 分钟
+Leaf5RootTool.exe --backup-fw critical          # 启动链 + 系统链（含 6 GB 的 super），很久
+Leaf5RootTool.exe --backup-fw boot_b,dtbo_a     # 只备指定分区
+```
+
+产物是一个目录：`%LOCALAPPDATA%\Leaf5RootTool\backup\l5fw_<机型>_<时间>\`，
+里面是 `<分区>.img.gz` 和 `manifest.json`。manifest 记着每个分区的块设备、
+字节数、md5 —— 恢复时按它对账，少一个字节都不写。
+
+```bash
+Leaf5RootTool.exe --restore-fw "C:\...\l5fw_Leaf5_20261104_134903"
+Leaf5RootTool.exe --restore-fw "C:\..." --fw-part boot_b     # 只写一个分区
+```
+
+恢复时每个分区动手前会做三件事：校验本地镜像 md5、把**当前**内容再备份到
+`_safety_<时间>\`、写完回读分区 md5 与 manifest 对账。任何一步不符就停在那，
+不会接着写下一个分区。
+
+Leaf5 实测（96 MB 的 `boot_a`）：
+
+```
+备份  dd 96 MB → gzip 35 MB → 分块拉回 → 本地解压算 md5
+      md5 d3436c154933   设备侧 / manifest / 本地三处一致
+恢复  安全备份 → 推送 96 MB → dd 写回 → 回读 md5 一致
+```
+
+整份 `boot` 组是 10 个分区 / 432 MB，约 5 分钟，压缩后占 155 MB。
+`userdata` 不在任何预设里 —— 50 GB，而且刷机本来就不动它。
+
+备份目录格式与 V2（`leaf5-toolkit`）完全一致：两个工具的备份可以互相恢复。
+
 ### 原厂固件包：地址、解密、提 boot
 
 `boot_b.img` 是 Magisk patch 过的，不能当原厂基底。原厂镜像在官方 `update.upx` 里，
@@ -837,7 +875,18 @@ Leaf5RootTool.exe --grant com.foo.bar 直接把 root 授权写进 policies（免
 Leaf5RootTool.exe --grant all         给所有已装第三方 app 授权
 Leaf5RootTool.exe --grant-list        看当前 policies 表
 Leaf5RootTool.exe --revoke com.foo.bar 收回授权
+Leaf5RootTool.exe --fw-list           列出设备分区（只读，不改动）
+Leaf5RootTool.exe --backup-fw         备份固件，默认 critical（启动链+系统链）
+Leaf5RootTool.exe --backup-fw boot    只备启动链，约 5 分钟
+Leaf5RootTool.exe --backup-fw all     全部分区（含 50 GB userdata）
+Leaf5RootTool.exe --backup-fw boot_b,dtbo_a   只备指定分区
+Leaf5RootTool.exe --fw-out D:\bk      备份放哪（默认 %LOCALAPPDATA%\Leaf5RootTool\backup）
+Leaf5RootTool.exe --restore-fw <DIR>  从备份目录逐分区写回
+Leaf5RootTool.exe --restore-fw <DIR> --fw-part boot_b   只写一个分区
 ```
+
+`--backup-fw` 产出 `<分区>.img.gz` + `manifest.json`；`--restore-fw` 写每个分区前
+校验镜像 md5、把当前内容存进 `_safety_<时间>\`、写完回读分区 md5 对账，不符就停。
 
 `--grant` 走的是 `su -c 'magisk --sqlite "insert or replace into policies ..."'`，
 写完读回自证。设备上得先有能用的 `su`（本工具刷完就有）。**31.0** 上
