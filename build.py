@@ -29,7 +29,7 @@ GP_NAME = "Leaf5RootTool_gplay"
 # 换成自签名证书后，别人从 EXE 里能读到的只有这一个名字，不含公司名/个人信息。
 # 想换：set LEAF5_SIGN_CN=CN=你自己的名字 后跑 --sign，或改这里重新生成证书。
 SIGN_CN = "SWT"
-VERSION = (1, 1, 16, 0)
+VERSION = (1, 1, 17, 0)
 
 # fastboot.exe 和 adb 共用 AdbWinApi.dll / AdbWinUsbApi.dll，一起进 assets/adb。
 # 它只给「fastbootd 刷 boot」用：ONYX 的 abl 裁掉了 bootloader 模式的 flash，

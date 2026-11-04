@@ -56,7 +56,7 @@ except ImportError:  # 精简版 Python 可能没带 tcl/tk
 # ----------------------------------------------------------------------------
 
 APP_NAME = "Leaf5 Root Tool"
-APP_VER = "1.1.16"
+APP_VER = "1.1.17"
 
 # 本工具适配的唯一目标。写在界面上、写进日志、拿来卡住别的机型。
 # 62 个偏移 + services.jar 补丁点全部绑死在这个三元组上，换任何一个都不成立。
@@ -314,8 +314,8 @@ FW_PRESETS = {
 # userdata 单独拎出来说清楚：它是 50 GB 的个人数据，跟「固件」不是一回事，
 # 混进默认预设会让一次备份从 5 分钟变成半小时，而且恢复它才是真正的误伤来源。
 FW_UI_PRESETS = (
-    ("启动链+系统链（默认）", "critical"),
-    ("启动链 boot 组", "boot"),
+    ("启动链（默认，约 432 MB）", "boot"),
+    ("加系统盘 super（约 6.9 GB）", "critical"),
     ("全部分区（含 userdata）", "all"),
 )
 
@@ -421,41 +421,63 @@ def fw_md5_gz(path):
 def fw_dump_one(adb, name, dev, size, dest, say):
     """把一个分区 dd 出来、压缩后拉回 PC，双向 md5 自证。返回 manifest 里的一条。"""
     remote = "%s/%s.img" % (FW_DEV_DIR, name)
+    gzr = remote + ".gz"
     say("  %-16s %7.1f MB → 设备内 dd…" % (name, size / 1048576.0))
     adb.shell("su -c 'mkdir -p %s; chmod 777 %s'" % (FW_DEV_DIR, FW_DEV_DIR),
               timeout=30)
 
-    cmd = "su -c 'dd if=/dev/block/by-name/%s of=%s bs=4M 2>&1; echo RC=$?'" % (name, remote)
-    out = adb.shell(cmd, timeout=max(300, size // (4 << 20) + 180)) or ""
-    if "RC=0" not in out:
-        raise RuntimeError("dd 备份 %s 失败：%s" % (name, out.strip()[-200:]))
+    # 先算这一趟要占多少设备空间：dd 出的 img 和压缩出的 gz 会同时在盘上，
+    # 分块拉取还要再放一份 split 副本。super 是 6 GB —— 等 dd 跑完十分钟才报
+    # ENOSPC 不如一开始就说清楚。free=0 表示读不到，按「未知」放行。
+    need = size + size // 4
+    free = adb._dev_free(FW_DEV_DIR)
+    if free and free < need:
+        raise RuntimeError(
+            "设备 /data 可用 %.0f MB，这个分区备份需要 ≈ %.0f MB —— 先清 %s"
+            % (free / 1e6, need / 1e6, FW_DEV_DIR))
 
-    got = adb._dev_size(remote)
-    if got != size:
-        raise RuntimeError("dd 产物 %d 字节，分区是 %d 字节" % (got, size))
+    # 无论成败都扫干净：失败时留下的是 6 GB img + 1.3 GB gz，
+    # 下一次备份会在开头就撞空间不足，看起来像「第二次也坏了」。
+    try:
+        cmd = "su -c 'dd if=/dev/block/by-name/%s of=%s bs=4M 2>&1; echo RC=$?'" % (name, remote)
+        out = adb.shell(cmd, timeout=max(300, size // (4 << 20) + 180)) or ""
+        if "RC=0" not in out:
+            raise RuntimeError("dd 备份 %s 失败：%s" % (name, out.strip()[-200:]))
 
-    dev_md5 = (adb.shell("su -c 'md5sum %s'" % remote,
-                         timeout=max(120, size // (1 << 20) + 60)) or "").split()
-    if not dev_md5:
-        raise RuntimeError("读不到设备侧 md5（%s）" % name)
-    dev_md5 = dev_md5[0]
+        got = adb._dev_size(remote)
+        if got != size:
+            raise RuntimeError("dd 产物 %d 字节，分区是 %d 字节" % (got, size))
 
-    gzr = remote + ".gz"
-    adb.shell('su -c "gzip -1 -c %s > %s && chmod 644 %s"' % (remote, gzr, gzr),
-              timeout=max(300, size // (1 << 20) + 120))
-    gzs = adb._dev_size(gzr)
-    if gzs < 1024:
-        raise RuntimeError("压缩包只有 %d 字节，gzip 没读到输入" % gzs)
+        dev_md5 = (adb.shell("su -c 'md5sum %s'" % remote,
+                             timeout=max(120, size // (1 << 20) + 60)) or "").split()
+        if not dev_md5:
+            raise RuntimeError("读不到设备侧 md5（%s）" % name)
+        dev_md5 = dev_md5[0]
 
-    local_gz = os.path.join(dest, "%s.img.gz" % name)
-    adb.pull(gzr, local_gz, expect_size=gzs)
-    local_md5, local_size = fw_md5_gz(local_gz)
-    if local_size != size:
-        raise RuntimeError("%s 解压后 %d 字节，分区是 %d" % (name, local_size, size))
-    if local_md5 != dev_md5:
-        raise RuntimeError("%s 校验失败：设备 %s != 本地 %s"
-                           % (name, dev_md5[:12], local_md5[:12]))
-    adb.shell("su -c 'rm -f %s %s'" % (gzr, remote), timeout=30)
+        adb.shell('su -c "gzip -1 -c %s > %s && chmod 644 %s"' % (remote, gzr, gzr),
+                  timeout=max(300, size // (1 << 20) + 120))
+        gzs = adb._dev_size(gzr)
+        if gzs < 1024:
+            raise RuntimeError("压缩包只有 %d 字节，gzip 没读到输入" % gzs)
+
+        # 压缩包已有全部数据，原始 img 立刻删掉：分块拉取还要在盘上再放一份
+        # split 副本，super 的 6 GB 不删就容易在 split 写到一半时空间见底。
+        adb.shell("su -c 'rm -f %s'" % remote, timeout=30)
+
+        local_gz = os.path.join(dest, "%s.img.gz" % name)
+        adb.pull(gzr, local_gz, expect_size=gzs)
+        local_md5, local_size = fw_md5_gz(local_gz)
+        if local_size != size:
+            raise RuntimeError("%s 解压后 %d 字节，分区是 %d" % (name, local_size, size))
+        if local_md5 != dev_md5:
+            raise RuntimeError("%s 校验失败：设备 %s != 本地 %s"
+                               % (name, dev_md5[:12], local_md5[:12]))
+    finally:
+        try:
+            adb.shell("su -c 'rm -f %s %s'" % (gzr, remote), timeout=30)
+        except Exception:
+            pass
+
     say("  %-16s %7.1f MB  md5 %s" % (name, size / 1048576.0, local_md5[:12]))
     return {"name": name, "dev": dev, "size": size, "md5": local_md5,
             "file": os.path.basename(local_gz), "file_size": gzs, "gz": True}
@@ -1031,6 +1053,24 @@ class Adb:
         rc, out, err = self.run(["shell", cmd], timeout=timeout)
         return out.strip()
 
+    def run_bin(self, args, timeout=600):
+        """同 run，但 stdout 原样返回字节。
+
+        exec-out 吐的是 gz 片段，走 run() 的 decode("utf-8","replace") 会把
+        非法字节换成 U+FFFD，拼回去的压缩包就再也解不开了。
+        """
+        try:
+            p = subprocess.run(
+                self._argv(args),
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                timeout=timeout, env=self.env, creationflags=CREATE_NO_WINDOW,
+            )
+            return p.returncode, (p.stdout or b"")
+        except subprocess.TimeoutExpired:
+            return 124, b""
+        except FileNotFoundError:
+            return 127, b""
+
     def spawn_background(self, cmd):
         """
         在设备上起一个脱离 adb 会话的进程。
@@ -1059,6 +1099,42 @@ class Adb:
             last = (err or out).strip()[:200] or "远端大小不符"
             self._reconnect()
         raise AdbError(f"push 失败 {os.path.basename(local)}: {last}")
+
+    def _dev_free(self, path="/data/local/tmp"):
+        """设备上 path 所在分区的可用字节数。读不到返回 0（按「未知」处理）。
+
+        不能在读不到时返回 0 又当成「没空间」—— 那样会把能做的备份挡在门外。
+        """
+        try:
+            out = self.shell("df -k %s 2>/dev/null" % path, timeout=30)
+        except Exception:
+            return 0
+        for line in out.splitlines()[1:]:
+            f = line.split()
+            if len(f) < 4:
+                continue
+            try:
+                return int(f[3]) * 1024
+            except ValueError:
+                continue
+        return 0
+
+    def _dir_bytes(self, devdir):
+        """目录里所有普通文件的字节数之和。读不到返回 0（调用方按「未知」处理）。"""
+        try:
+            out = self.shell("ls -l %s 2>/dev/null" % devdir, timeout=60)
+        except Exception:
+            return 0
+        total = 0
+        for line in out.splitlines():
+            f = line.split()
+            if len(f) < 5 or not f[0].startswith("-"):
+                continue
+            try:
+                total += int(f[4])
+            except ValueError:
+                continue
+        return total
 
     def _dev_size(self, remote, tries=3):
         """设备上文件的字节数；读不到返回 0。USB 抖的时候 shell 也会空回，重试几次。"""
@@ -1205,9 +1281,17 @@ class Adb:
         if not parts:
             raise AdbError("分块失败：设备上没有产出 part_*（split 不可用？）")
 
+        # split 在 /data 写满时会写一半就退出：前面几块完好、后面几块短甚至没有，
+        # 只有拉到那一块才炸，时间全花在「以为快好了」上。当场认出来。
+        made = self._dir_bytes(devdir)
+        if made and made != size:
+            raise AdbError("分块产物合计 %d 字节，源文件是 %d —— split 中途退出了"
+                           "（多半是 /data 空间不够）" % (made, size))
+
         tmp = local + ".parts"
         os.makedirs(tmp, exist_ok=True)
         got = 0
+        via_cat = 0
         try:
             for i, name in enumerate(parts):
                 # 除最后一块，其余都应恰好等于 chunk
@@ -1216,25 +1300,41 @@ class Adb:
                 ok = False
                 last = ""
                 for n in range(tries):
-                    try:
-                        rc, out, err = self.run(["pull", "%s/%s" % (devdir, name), dst],
-                                                timeout=300)
-                        last = (err or out).strip().splitlines()
-                        last = last[-1][:120] if last else ("rc=%d" % rc)
-                    except Exception as e:
-                        last = str(e)[:120]
+                    # 偶数次 pull、奇数次 exec-out。单块超时压到 60 s：2 MB
+                    # 正常 0.2 秒，真卡住时等满 600 秒，一块就吃掉十分钟。
+                    if n % 2 == 0:
+                        try:
+                            rc, out, err = self.run(
+                                ["pull", "%s/%s" % (devdir, name), dst], timeout=60)
+                            tail = (err or out).strip().splitlines()
+                            last = tail[-1][:120] if tail else ("rc=%d" % rc)
+                        except Exception as e:
+                            last = str(e)[:120]
+                    else:
+                        try:
+                            rc, buf = self.run_bin(
+                                ["exec-out", 'cat "%s/%s"' % (devdir, name)], timeout=60)
+                            with open(dst, "wb") as f:
+                                f.write(buf)
+                            last = "exec-out %d 字节" % len(buf)
+                        except Exception as e:
+                            last = str(e)[:120]
                     if os.path.isfile(dst) and os.path.getsize(dst) == want:
                         ok = True
+                        if n % 2:
+                            via_cat += 1
                         break
-                    if os.path.exists(dst):
-                        os.remove(dst)
-                    time.sleep(3)
+                    # 第一次失败不动连接：链路好的时候 reconnect 反而把它踢下线，
+                    # 下一次 pull 必败，12 次全撞同一个坑。两条通路都试过才怀疑连接。
+                    if n == 0:
+                        continue
+                    time.sleep(1)
                     self._reconnect()
                 if not ok:
                     raise AdbError(
-                        "分块拉取失败：第 %d/%d 块（%s 应为 %d 字节）重试 %d 次仍不完整。"
-                        "最后一次：%s"
-                        % (i + 1, len(parts), name, want, tries, last))
+                        "分块拉取失败：第 %d/%d 块（%s 应为 %d 字节）两条通路都试过"
+                        "仍不完整。最后一次：%s"
+                        % (i + 1, len(parts), name, want, last))
                 got += want
                 time.sleep(0.5)
 
@@ -1253,7 +1353,7 @@ class Adb:
             raise AdbError("分块合计 %d 字节，分区是 %d 字节，不完整" % (got, size))
         if os.path.getsize(local) != size:
             raise AdbError("合并后 %d 字节，应为 %d" % (os.path.getsize(local), size))
-        return "%d bytes in %d parts" % (got, len(parts))
+        return "%d bytes in %d parts (exec-out 兜底 %d 块)" % (got, len(parts), via_cat)
 
     # -- 上层 ----------------------------------------------------------------
 
@@ -3738,7 +3838,7 @@ class App:
             messagebox.showerror("没有 adb", "adb 还没就绪，先点「刷新设备」。")
             return
         # 标签 → spec。找不到就退回默认档（critical），不猜别的
-        spec = dict(FW_UI_PRESETS).get(self.var_fw.get(), "critical")
+        spec = dict(FW_UI_PRESETS).get(self.var_fw.get(), "boot")
 
         out_root = backup_dir()
         if spec == "all":
@@ -4385,10 +4485,11 @@ def main():
                     help="只打印当前授权表，不改动")
     ap.add_argument("--fw-list", action="store_true",
                     help="列出设备分区（名字 / 大小 / 块设备），只读")
-    ap.add_argument("--backup-fw", nargs="?", const="critical", default=None,
+    ap.add_argument("--backup-fw", nargs="?", const="boot", default=None,
                     metavar="SPEC",
                     help="备份设备固件：boot / critical / all，或逗号分隔的分区名。"
-                         "默认 critical = 启动链 + 系统链（不含 userdata）")
+                         "默认 boot = 启动链 10 个分区（约 432 MB）；"
+                         "critical 会多备 super（6.1 GB，慢）")
     ap.add_argument("--restore-fw", default=None, metavar="DIR",
                     help="从备份目录逐分区写回（写前自动再备份目标分区）")
     ap.add_argument("--fw-out", default=None, metavar="DIR",

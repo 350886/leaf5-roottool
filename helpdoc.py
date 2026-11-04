@@ -189,9 +189,11 @@ ONYX 的 abl 把 `fastboot flash` 这条 handler 裁了 —— bootloader 模式
 屏幕矮的时候不用滚 —— 同样三条也在 **菜单 → 工具** 里。
 
 ## 三档范围
-- `启动链+系统链（默认）` —— boot/recovery/vbmeta/dtbo + super/system/vendor 等，
-  Leaf5 上共 15 个分区。启动链 10 个分区 / 432 MB，压缩后 155 MB，约 5 分钟。
-- `启动链 boot 组` —— 只保启动链，最快，够救「刷 boot 刷崩」。
+- `启动链（默认，约 432 MB）` —— boot/recovery/vbmeta/dtbo 的 a/b 两槽，Leaf5 上
+  10 个分区。压缩后 155 MB，约 5 分钟。**刷机刷崩、开不了机，靠这一份就能退回。**
+- `加系统盘 super（约 6.9 GB）` —— 再带上 super（6.1 GB）和 misc/persist/modem。
+  只有「系统盘本身被写坏、官网又拿不到同版本 OTA」才需要；一行 6 GB，
+  设备上要先腾出 ≈ 8 GB 才能做。
 - `全部分区（含 userdata）` —— 加上 50 GB userdata，会先弹一次确认。
 
 产物：`%LOCALAPPDATA%\\Leaf5RootTool\\backup\\l5fw_<机型>_<时间>\\`，
