@@ -56,7 +56,7 @@ except ImportError:  # 精简版 Python 可能没带 tcl/tk
 # ----------------------------------------------------------------------------
 
 APP_NAME = "Leaf5 Root Tool"
-APP_VER = "1.1.15"
+APP_VER = "1.1.16"
 
 # 本工具适配的唯一目标。写在界面上、写进日志、拿来卡住别的机型。
 # 62 个偏移 + services.jar 补丁点全部绑死在这个三元组上，换任何一个都不成立。
@@ -309,6 +309,15 @@ FW_PRESETS = {
                  "misc", "persist", "modem", "lk", "tee"),
     "all": None,
 }
+
+# 界面上给的三档。值是 fw_pick_parts 认的 spec，键是下拉框里那行字。
+# userdata 单独拎出来说清楚：它是 50 GB 的个人数据，跟「固件」不是一回事，
+# 混进默认预设会让一次备份从 5 分钟变成半小时，而且恢复它才是真正的误伤来源。
+FW_UI_PRESETS = (
+    ("启动链+系统链（默认）", "critical"),
+    ("启动链 boot 组", "boot"),
+    ("全部分区（含 userdata）", "all"),
+)
 
 # 列分区：名字 + 真实块设备 + 字节数。blockdev 被裁时退 /sys/class/block/*/size
 _FW_LIST_SH = (
@@ -2726,6 +2735,54 @@ class App:
         act = tk.Frame(inner, bg=BG2, highlightthickness=0)
         act.pack(fill="x", padx=12, pady=8)
 
+        # 第一行：固件备份 / 恢复。
+        # 为什么摆在 root 前面：这是唯一一件「现在不做、以后可能再也做不了」的
+        # 事 —— 官方 OTA 只保证最新版，机器上跑的那一版不一定还下得到。备份只用
+        # 只读 dd，不需要 root 之外的前提，也不会改设备状态；而 root / 刷机正是
+        # 会把它弄坏的动作。所以顺序上它在前面，且在视口第一屏，不用滚动。
+        opt_fw = tk.Frame(act, bg=BG2)
+        opt_fw.pack(fill="x", padx=10, pady=(10, 4))
+        tk.Label(opt_fw, text="固件留底？", bg=BG2, fg=FG_DIM,
+                 font=("Microsoft YaHei UI", 9)).pack(side="left", anchor="n",
+                                                       pady=(5, 0))
+
+        # 用 tk.OptionMenu 而不是 ttk.Combobox：ttk 那个在 vista 主题下的
+        # readonly 态由主题自己画字，`style configure(foreground=…)` 压不住，
+        # 实测打包版出来就是一个空黑框（值其实选着，用户看不到而已）。
+        # OptionMenu 是纯 tk 控件，三色全部可控，跟这一窗的深色能对上。
+        self.var_fw = tk.StringVar(value=FW_UI_PRESETS[0][0])   # 默认不含 userdata
+        self.cmb_fw = tk.OptionMenu(opt_fw, self.var_fw,
+                                    *[x[0] for x in FW_UI_PRESETS])
+        self.cmb_fw.configure(bg=BG3, fg=FG, activebackground=ACCENT_H,
+                              activeforeground="#ffffff", relief="flat",
+                              bd=0, highlightthickness=0, anchor="w",
+                              font=("Microsoft YaHei UI", 9), cursor="hand2")
+        m = self.cmb_fw["menu"]
+        m.configure(bg=BG3, fg=FG, activebackground=ACCENT,
+                    activeforeground="#ffffff", bd=0, tearoff=0,
+                    font=("Microsoft YaHei UI", 9))
+        self.cmb_fw.pack(side="left", padx=8, anchor="n", pady=(3, 0), ipadx=6)
+
+        # 说明文字按 box_w=136 的可用宽度写，超过两行会把整行撑高、
+        # 挤掉下面那行「用在」—— 实测「刷坏、开不了机、要退回原样」就溢出了。
+        g, self.btn_fwbackup, _ = self._btn_group(
+            opt_fw, "备份固件", self.start_fw_backup,
+            "dd→gz→拉回，双端 md5",
+            when="刷机 / 换 ROM 前", w=14)
+        g.pack(side="left", padx=(0, 10))
+
+        g, self.btn_fwrestore, _ = self._btn_group(
+            opt_fw, "恢复固件", self.start_fw_restore,
+            "按 manifest 写回",
+            when="刷坏了要退回原样", w=14)
+        g.pack(side="left", padx=(0, 10))
+
+        g, self.btn_fwlist, _ = self._btn_group(
+            opt_fw, "分区表", self.act_fw_list,
+            "列出全部块分区",
+            when="不确定备哪些", w=12)
+        g.pack(side="left")
+
         row = tk.Frame(act, bg=BG2)
         row.pack(fill="x", padx=10, pady=10)
 
@@ -3065,6 +3122,12 @@ class App:
         m_tool.add_command(label="清空日志窗口", accelerator="Ctrl+L",
                            command=self.act_clear_log)
         m_tool.add_command(label="内核适配向导", command=self.open_adapter)
+        m_tool.add_separator()
+        # 备份/恢复也挂菜单：界面上那三个按钮在 1366×768 上要滚动才看得到，
+        # 而这两件事恰恰是「开不了机」时最急的动作。
+        m_tool.add_command(label="备份固件…", command=self.start_fw_backup)
+        m_tool.add_command(label="恢复固件…", command=self.start_fw_restore)
+        m_tool.add_command(label="查看分区表", command=self.act_fw_list)
         bar.add_cascade(label="工具", menu=m_tool)
 
         m_help = self._submenu(bar)
@@ -3315,12 +3378,17 @@ class App:
         # 用 getattr 而不是直接读属性 —— 属性是 _build 里赋的，构建中途
         # 出过异常时它们根本不存在，那样写会在 _busy 里炸掉，把真正的
         # 构建错误盖成一句 AttributeError。
-        for attr in ("btn_edlflash", "btn_fbdflash", "btn_payload"):
+        for attr in ("btn_edlflash", "btn_fbdflash", "btn_payload",
+                     "btn_fwbackup", "btn_fwrestore", "btn_fwlist"):
             w = getattr(self, attr, None)
             if w is not None:
                 ws.append(w)
         for w in ws:
             w.configure(state=state)
+        # 下拉框也要锁：备份跑到一半改预设，下一次点按钮取到的是新值
+        cmb = getattr(self, "cmb_fw", None)
+        if cmb is not None:
+            cmb.configure(state="disabled" if b else "normal")
         for w in (self.chk_magisk, self.chk_module):
             w.configure(state=state)
         self.btn_refresh.configure(state=state)
@@ -3626,6 +3694,157 @@ class App:
                     "刷坏了也用它刷回来。"
                     % (info["path"], info["bytes"] / 1048576.0,
                        "正常" if hdr else "异常（别拿去刷）"))))
+
+        threading.Thread(target=job, daemon=True).start()
+
+    # -- 固件备份 / 恢复 ------------------------------------------------------
+    #
+    # 这三条都要求设备已有 su（读块设备要 root）。没 root 时 fw_require_root
+    # 直接抛错，一个字节都不写 —— 报错里带着「先跑一键 root」的下一步。
+
+    def _fw_log(self, s=""):
+        # 生产者是后台线程，不能碰 Text；统一走队列，由 _poll 在主线程序列化
+        self.q.put(("log", str(s)))
+
+    def act_fw_list(self):
+        adb = self.adb
+        if not adb:
+            messagebox.showerror("没有 adb", "adb 还没就绪，先点「刷新设备」。")
+            return
+
+        def job():
+            try:
+                rows = fw_list_parts(adb)
+            except Exception as e:
+                msg = str(e)
+                self.q.put(("log", "[错误] 读分区表失败：%s" % msg))
+                self.root.after(0, lambda m=msg: messagebox.showerror(
+                    "读分区表失败", m))
+                return
+            total = sum(r[2] for r in rows)
+            self.q.put(("log", "== 分区表：%d 个，合计 %.1f MB =="
+                               % (len(rows), total / 1048576.0)))
+            for n, d, s in rows:
+                self.q.put(("log", "  %-20s %9.1f MB  %s"
+                                   % (n, s / 1048576.0, d)))
+            self.q.put(("log", "  提示：userdata 不在任何预设里 —— 它是个人数据，"
+                               "恢复它会覆盖设备上的东西。"))
+
+        threading.Thread(target=job, daemon=True).start()
+
+    def start_fw_backup(self):
+        adb = self.adb
+        if not adb:
+            messagebox.showerror("没有 adb", "adb 还没就绪，先点「刷新设备」。")
+            return
+        # 标签 → spec。找不到就退回默认档（critical），不猜别的
+        spec = dict(FW_UI_PRESETS).get(self.var_fw.get(), "critical")
+
+        out_root = backup_dir()
+        if spec == "all":
+            if not messagebox.askyesno(
+                    "备份全部分区",
+                    "「全部分区」包含 userdata（这台机 50 GB 上下，里面是你的"
+                    "应用数据、照片、账号）。\n\n"
+                    "压缩后仍可能十几 GB，传输要很久；而且这份备份一旦恢复，"
+                    "设备会被拉回备份那一刻的状态。\n\n"
+                    "只为了「刷坏能救回来」，选默认那档就够了。仍然要全备？"):
+                return
+        self._busy(True)
+        self.q.put(("log", "== 固件备份（%s）==" % spec))
+        self.q.put(("log", "  输出目录 %s" % out_root))
+
+        def job():
+            try:
+                dest = fw_backup(adb, spec, out_root, log=self._fw_log)
+            except Exception as e:
+                msg = str(e)
+                self.q.put(("log", "[错误] 备份失败：%s" % msg))
+                self.root.after(0, lambda m=msg: (
+                    self._busy(False),
+                    messagebox.showerror("固件备份失败", m)))
+                return
+            self.root.after(0, lambda d=dest: (
+                self._busy(False),
+                messagebox.showinfo(
+                    "固件备份完成",
+                    "目录：\n%s\n\n"
+                    "每个分区一个 .img.gz，外加 manifest.json（带每个分区的 md5）。\n"
+                    "把它整个拷到别的盘留一份 —— 设备彻底刷坏时，这份目录是"
+                    "唯一能按原样写回去的东西。\n\n"
+                    "恢复：点「恢复固件」，选上面这个目录。" % d)))
+
+        threading.Thread(target=job, daemon=True).start()
+
+    def start_fw_restore(self):
+        adb = self.adb
+        if not adb:
+            messagebox.showerror("没有 adb", "adb 还没就绪，先点「刷新设备」。")
+            return
+
+        path = filedialog.askdirectory(
+            title="选择固件备份目录（里面有 manifest.json）",
+            initialdir=backup_dir())
+        if not path:
+            return
+
+        mf_path = os.path.join(path, "manifest.json")
+        try:
+            with open(mf_path, "r", encoding="utf-8") as f:
+                mf = json.load(f)
+        except Exception as e:
+            messagebox.showerror(
+                "不是备份目录",
+                "%s\n\n读不到 manifest.json：%s" % (path, e))
+            return
+
+        parts = mf.get("parts") or []
+        dev = mf.get("device") or {}
+        if not parts:
+            messagebox.showerror("备份是空的", "manifest.json 里没有分区条目。")
+            return
+
+        detail = ("备份目录：%s\n"
+                  "来源设备：%s / %s\n"
+                  "备份时间：%s\n"
+                  "分区：%d 个，合计 %.1f MB\n\n"
+                  "%s\n\n"
+                  "顺序：写前先把该分区当前内容再备份一份（_safety_ 目录）"
+                  "→ 推送 → dd 写回 → 回读 md5 比对。\n"
+                  "一个分区校验不过就停，不会继续往下搅。\n"
+                  "写完必须重启才生效。\n\n继续？"
+                  % (os.path.basename(path),
+                     dev.get("model") or "?", dev.get("build") or "?",
+                     mf.get("created") or "?",
+                     len(parts),
+                     (mf.get("total_bytes") or 0) / 1048576.0,
+                     ", ".join(p["name"] for p in parts)))
+
+        if not messagebox.askyesno("确认恢复固件", detail):
+            return
+
+        self._busy(True)
+        self.q.put(("log", "== 固件恢复 =="))
+        self.q.put(("log", "  源 %s（%d 个分区）" % (path, len(parts))))
+
+        def job():
+            try:
+                n = fw_restore(adb, path, only=None, log=self._fw_log)
+            except Exception as e:
+                msg = str(e)
+                self.q.put(("log", "[错误] 恢复失败：%s" % msg))
+                self.root.after(0, lambda m=msg: (
+                    self._busy(False),
+                    messagebox.showerror("固件恢复失败", m)))
+                return
+            self.root.after(0, lambda k=n: (
+                self._busy(False),
+                messagebox.showinfo(
+                    "恢复完成",
+                    "%d 个分区已写回并通过回读校验。\n\n"
+                    "重启才生效：长按电源键，或在命令行 adb reboot。\n\n"
+                    "开机后仍不对：备份目录旁的 _safety_<时间>\\ 里存着写入前"
+                    "的内容，能再写回去。" % k)))
 
         threading.Thread(target=job, daemon=True).start()
 

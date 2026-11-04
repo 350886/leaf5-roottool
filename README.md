@@ -209,6 +209,9 @@ adb shell su -c "cp /system/framework/services.jar /data/local/tmp/s.jar"
 官网只发 OTA 全量包，版本不一定对得上你手上这台（跨版本升过级、刷过 beta、机器比包新）。
 所以刷之前先把当前固件整体抠一份下来 —— 这份是「只有你有」的，官网没有。
 
+**界面上就在第一行**：`固件留底？` → 下拉选范围 → `备份固件` / `恢复固件` / `分区表`。
+（也挂在 菜单 → 工具 里，屏幕矮不用滚。）
+
 ```bash
 Leaf5RootTool.exe --fw-list                     # 只读：列分区名 / 大小 / 块设备
 Leaf5RootTool.exe --backup-fw boot              # 启动链（boot/recovery/vbmeta/dtbo），约 5 分钟
