@@ -55,7 +55,7 @@ except ImportError:  # 精简版 Python 可能没带 tcl/tk
 # ----------------------------------------------------------------------------
 
 APP_NAME = "Leaf5 Root Tool"
-APP_VER = "1.1.12"
+APP_VER = "1.1.14"
 
 # 本工具适配的唯一目标。写在界面上、写进日志、拿来卡住别的机型。
 # 62 个偏移 + services.jar 补丁点全部绑死在这个三元组上，换任何一个都不成立。
@@ -97,7 +97,7 @@ CHAIN_ENV = (
 DEFAULT_PORT = 5037
 
 # ---- Magisk 集成 ----------------------------------------------------------
-MAGISK_VER = "31.1"
+MAGISK_VER = "31.0"
 DEV_MGK = f"{DEV_ROOT}/mgk"
 DEV_KITS = f"{DEV_MGK}/kits"
 
@@ -112,6 +112,16 @@ APK_TOOLS = {
     "lib/arm64-v8a/libbusybox.so": "busybox",
     "assets/boot_patch.sh": "boot_patch.sh",
     "assets/util_functions.sh": "util_functions.sh",
+}
+
+# 有就取、没有就跳过。boot_patch.sh 对 stub 的依赖按版本变：
+#   v31.0 及以前：第 179 行 `./magiskboot compress=xz stub.apk stub.xz`，
+#                没有 stub.apk 就压不出 stub.xz，后面 cpio add 必失败
+#                （实测 "lstat 'stub.xz': No such file or directory" +
+#                 "Failed to process cpio" + "没产出 new-boot.img"）
+#   v31.1：stub 独立发布，APK 里已经没有这个文件，也不需要
+APK_OPTIONAL = {
+    "assets/stub.apk": "stub.apk",
 }
 
 # /data/adb/magisk 里必须有 busybox，否则 setup_magisk_env 直接 abort，
@@ -287,6 +297,163 @@ def magisk_apk_path():
     return resource_path("assets", "magisk", f"Magisk-v{MAGISK_VER}.apk")
 
 
+# ----------------------------------------------------------------------------
+# Magisk 超级用户授权表（policies）
+# ----------------------------------------------------------------------------
+# 为什么工具要管这件事：
+# 版本边界很窄，但决定性强 ——
+#   v31.0 及以前：daemon 的 app_request() 会 `exec_cmd("request")` 拉起
+#                 SuRequestActivity，屏幕上真的会弹「授予 / 拒絕」，点「授予」
+#                 就写 policies 表，app 拿到 root。
+#   v31.1 起：    app_request() 整段被删（connect.rs 只剩 app_notify），
+#                 app 侧 SuRequestActivity 也从 manifest 里消失，只剩
+#                 SuCallbackHandler.kt 发一条 toast / 状态栏通知，没有任何
+#                 Activity 可以点「允许」。daemon 侧 RootSettings::default()
+#                 是 Deny，policies 表里没有这个 uid 就直接
+#                 warn "su: request rejected" 回 EACCES，客户端 exit 13。
+#                 结果：刷完机手机是 root 的（adb shell 能 uid=0），但任何 app
+#                 执行 su 都失败，只能去 Magisk app 的「超级用户」页逐个打开。
+# 下面这几个函数把那一步自动化：直接往 policies 表写 Allow。
+# 两个版本都留着用得上 —— 31.1 上是唯一的路，31.0 上可以省掉点弹框。
+#
+# 注意：daemon 有 3 秒的 SuInfo 缓存（su/daemon.rs: is_fresh()），
+# 写完库要等 3 秒再让 app 重试，否则还是读到旧值。
+
+SU_POLICY_DENY = 1
+SU_POLICY_ALLOW = 2      # 见 app/core/.../model/su/SuPolicy.kt 的常量顺序
+
+
+def su_probe(adb):
+    """找一个真能拿到 uid=0 的 su 路径。
+
+    Leaf5 上 ONYX 的 preinit 会把 magisk 复制到 /product/bin/su，
+    所以不能只试裸 "su" —— 有的固件 PATH 里没有 /product/bin。
+    """
+    for p in ("/product/bin/su", "/debug_ramdisk/su", "/system/bin/su", "su"):
+        try:
+            rc, out, err = adb.run(["shell", p + " -c id"], timeout=12)
+        except Exception:
+            continue
+        if "uid=0" in out:
+            return p
+    return None
+
+
+def su_shell(adb, su, inner, timeout=30):
+    """su -c '<inner>'，返回 (rc, stdout, stderr)。
+
+    内层用单引号包住，所以 inner 里不能再出现单引号；
+    双引号是安全的（留给 magisk --sqlite 用）。
+    """
+    if "'" in inner:
+        raise AdbError("su_shell 不接受含单引号的命令")
+    return adb.run(["shell", "%s -c '%s'" % (su, inner)], timeout=timeout)
+
+
+def magisk_sqlite(adb, su, sql, timeout=30):
+    """通过 magisk 自己的 sqlite 桥读写 /data/adb/magisk.db。
+
+    不用设备上的 sqlite3 —— Android 13 根本没有这个二进制。
+    magisk --sqlite 走 daemon，本身就是 root，也是 Magisk app 用的同一条路。
+    """
+    if '"' in sql or "'" in sql:
+        raise AdbError("SQL 里不能带引号：" + sql)
+    return su_shell(adb, su, 'magisk --sqlite "%s"' % sql, timeout=timeout)
+
+
+def pkg_uid(adb, pkg):
+    """包名 -> uid；没装返回 None。"""
+    rc, out, err = adb.run(["shell", "cmd package list packages -U"], timeout=25)
+    for line in out.splitlines():
+        line = line.strip()
+        if line.startswith("package:%s " % pkg) or line == "package:%s" % pkg:
+            m = re.search(r"uid:(\d+)", line)
+            if m:
+                return int(m.group(1))
+    # 个别固件的 -U 不带 uid，退回 dumpsys
+    rc, out, err = adb.run(["shell", "dumpsys package %s" % pkg], timeout=25)
+    m = re.search(r"userId=(\d+)", out)
+    return int(m.group(1)) if m else None
+
+
+def third_party_pkgs(adb):
+    """所有用户装的第三方 app（-s 排除系统包）。"""
+    rc, out, err = adb.run(["shell", "pm list packages -3"], timeout=25)
+    return sorted(l.strip()[8:] for l in out.splitlines()
+                  if l.strip().startswith("package:"))
+
+
+def list_policies(adb, su):
+    """返回 [(uid, policy, until, logging, notification), ...]
+
+    magisk --sqlite 的输出带列名：uid=2000|policy=2|until=0|logging=1|notification=1
+    （不是裸数字），所以要按 =数字 提取，不能直接 split 后 int()。
+    """
+    rc, out, err = magisk_sqlite(adb, su, "select * from policies", timeout=25)
+    rows = []
+    for line in out.splitlines():
+        line = line.strip()
+        if "|" not in line:
+            continue
+        nums = re.findall(r"=(\d+)", line)
+        if len(nums) != 5:
+            nums = [x for x in line.split("|") if x.strip().isdigit()]
+        if len(nums) != 5:
+            continue
+        rows.append(tuple(int(x) for x in nums))
+    return rows
+
+
+def describe_policy(p):
+    return {0: "询问(Query)", 1: "拒绝(Deny)", 2: "允许(Allow)",
+            3: "受限(Restrict)"}.get(p, "未知(%d)" % p)
+
+
+def grant_pkgs(adb, pkgs, revoke=False, log=print):
+    """把包名写进 policies 表（Allow=2）或删掉。返回 (成功数, 明细)。"""
+    su = su_probe(adb)
+    if not su:
+        raise AdbError("这台设备上没有能拿到 uid=0 的 su —— 先跑 --check 确认 root 状态")
+    log("[i] su 路径: %s" % su)
+    ok = 0
+    detail = []
+    for pkg in pkgs:
+        uid = pkg_uid(adb, pkg)
+        if uid is None:
+            log("  [!] %s 没装，跳过" % pkg)
+            detail.append((pkg, None, False))
+            continue
+        if revoke:
+            sql = "delete from policies where uid=%d" % uid
+        else:
+            # until=0 是永久；logging/notification 置 1，Magisk app 里能看到这条
+            sql = "insert or replace into policies values(%d,%d,0,1,1)" % (uid, SU_POLICY_ALLOW)
+        rc, o, e = magisk_sqlite(adb, su, sql)
+        good = rc == 0 and "Error" not in (o + e)
+        # 不要用 [✓]：中文 Windows 控制台是 GBK，U+2713 编不出来，
+        # print 抛 UnicodeEncodeError 被 emit 吞掉，整行都不显示 —— 看起来像没执行。
+        log("  %s %-40s uid=%-6s %s" % ("[+]" if good else "[x]", pkg, uid,
+                                        "已撤销" if revoke else "-> 允许"))
+        if not good:
+            log("      %s" % ((e or o).strip()[:160]))
+        ok += 1 if good else 0
+        detail.append((pkg, uid, good))
+
+    # 读回自证：不靠命令返回值，靠表里真有这一行
+    rows = list_policies(adb, su)
+    if not revoke:
+        want = {uid for _, uid, g in detail if g and uid}
+        have = {r[0] for r in rows if r[1] == SU_POLICY_ALLOW}
+        missing = want - have
+        if missing:
+            log("  [!] 读回校验：%s 没有变成 Allow" % sorted(missing))
+    log("[i] 当前授权表 %d 行：" % len(rows))
+    for r in rows:
+        log("      uid=%-6d %s" % (r[0], describe_policy(r[1])))
+    log("[i] daemon 有 3 秒 SuInfo 缓存，等 3 秒后再让 app 重试")
+    return ok, detail
+
+
 def extract_apk_tools(apk, dest):
     """
     从 APK 里取出 magiskboot / magiskinit / magisk64 ... 落到 dest。
@@ -306,6 +473,20 @@ def extract_apk_tools(apk, dest):
             with z.open(arc) as src, open(p, "wb") as f:
                 shutil.copyfileobj(src, f)
             out[dst] = p
+        for arc, dst in APK_OPTIONAL.items():
+            if arc not in names:
+                continue
+            p = os.path.join(dest, dst)
+            with z.open(arc) as src, open(p, "wb") as f:
+                shutil.copyfileobj(src, f)
+            out[dst] = p
+
+    # boot_patch.sh 里写死的是 `./magisk`，而 APK 里那份叫 magisk64
+    # （官方 App 的准备阶段会替它复制过去，我们直接在本地补齐）。
+    if "magisk64" in out and "magisk" not in out:
+        p = os.path.join(dest, "magisk")
+        shutil.copyfile(out["magisk64"], p)
+        out["magisk"] = p
     return out
 
 
@@ -472,28 +653,218 @@ class Adb:
         rc, out, err = self.run(["shell", wrapped], timeout=15)
         return rc, out, err
 
-    def push(self, local, remote, timeout=180):
-        rc, out, err = self.run(["push", local, remote], timeout=timeout)
-        if rc != 0:
-            raise AdbError(f"push 失败 {os.path.basename(local)}: {(err or out).strip()[:200]}")
-        return out
-
-    def pull(self, remote, local, timeout=600):
+    def push(self, local, remote, timeout=180, tries=3):
         """
-        拉文件到 PC。目标目录不存在时先建。
+        推文件到设备。带重试 + 远端大小校验。
 
-        备份 boot 这一步不能省 —— 只在设备上留一份的话，boot 写坏后系统起不来，
+        这台机器的 USB 传大文件会中途 reset（连 96 MB 的分区镜像都在 40% 断），
+        magisk64 / magisk32 各 9~10 MB，同样会踩。rc=0 不代表传全了，
+        所以推完必须比远端字节数。
+        """
+        want = os.path.getsize(local)
+        last = ""
+        for n in range(max(1, tries)):
+            rc, out, err = self.run(["push", local, remote], timeout=timeout)
+            if rc == 0 and self._dev_size(remote) == want:
+                return out
+            last = (err or out).strip()[:200] or "远端大小不符"
+            self._reconnect()
+        raise AdbError(f"push 失败 {os.path.basename(local)}: {last}")
+
+    def _dev_size(self, remote, tries=3):
+        """设备上文件的字节数；读不到返回 0。USB 抖的时候 shell 也会空回，重试几次。"""
+        for n in range(max(1, tries)):
+            try:
+                o = self.shell('wc -c < "%s" 2>/dev/null' % remote, timeout=20)
+                v = int(o.split()[0]) if o else 0
+                if v:
+                    return v
+            except (ValueError, IndexError):
+                pass
+            if n + 1 < tries:
+                time.sleep(2)
+        return 0
+
+    def wait_online(self, limit=40):
+        """等到设备回到 device 状态。返回 True/False，不抛异常。"""
+        end = time.time() + limit
+        while time.time() < end:
+            try:
+                rc, out, _ = self.run(["devices"], timeout=15)
+            except Exception:
+                out = ""
+            if "device" in (out or "") and "offline" not in (out or ""):
+                return True
+            time.sleep(2)
+        return False
+
+    def _reconnect(self, hard=False):
+        """
+        传输中断后的恢复。分温和 / 强硬两档 —— 这台机器上发现：
+        设备还在 device 状态时先 kill-server 反而把状态弄得更糟，
+        要先 `reconnect offline` 让它自己重新握手。
+        """
+        try:
+            self.run(["reconnect", "offline"], timeout=30)
+        except Exception:
+            pass
+        if self.wait_online(20):
+            return
+        # 还是没回来：只能整条 server 重启
+        try:
+            self.run(["kill-server"], timeout=20)
+        except Exception:
+            pass
+        time.sleep(3)
+        try:
+            self.run(["start-server"], timeout=60)
+        except Exception:
+            pass
+        self.wait_online(40)
+
+    def pull(self, remote, local, timeout=600, expect_size=None, chunk=2 << 20):
+        """
+        拉文件到 PC。目标目录不存在时先建。大文件自动分块。
+
+        为什么必须分块：这台 Leaf5 上整文件 pull 一个 96 MB 的 boot 分区，
+        稳定断在 40~45%，报 `error: protocol fault (couldn't read status):
+        connection reset`，而且 adb 之后还会掉成 offline。断了只能从头再来，
+        于是永远拿不到一份完整备份 —— 备份拿不到，后面的 dd 就不敢做。
+
+        块大小 2 MB：4 MB 也试过，单块失败一次要重传的字节多、恢复慢；
+        2 MB 一块在 34 MB 的压缩包上是 17 块，失败成本低、重试快。
+
+        备份本身不能省 —— 只在设备上留一份的话，boot 写坏后系统起不来，
         /data 也读不到，那份备份等于不存在。
         """
         d = os.path.dirname(local)
         if d:
             os.makedirs(d, exist_ok=True)
+        size = expect_size if expect_size is not None else self._dev_size(remote)
+        if size and size > chunk:
+            return self._pull_chunked(remote, local, size, chunk)
+
         rc, out, err = self.run(["pull", remote, local], timeout=timeout)
         if rc != 0:
             raise AdbError(f"pull 失败 {os.path.basename(remote)}: {(err or out).strip()[:200]}")
         if not os.path.isfile(local):
             raise AdbError(f"pull 返回成功但文件不在：{local}")
         return out
+
+    def pull_gz(self, remote, local, su=None, expect_size=None):
+        """
+        设备上先 gzip，再把压缩包拉回来解压。
+
+        为什么绕这一圈：96 MB 的 boot 镜像直接 pull，这台机器上稳定断在
+        40% 上下；gzip -1 之后只有 34 MB（实测 36053917 字节，1.5 秒），
+        传输量降到 1/3，失败率明显下来。gzip 无损，解压完再拿设备侧
+        md5 对一遍就能确认没走样。
+        """
+        import gzip as _gzip
+        gzr = remote + ".gz"
+        if su:
+            self.shell('%s -c "gzip -1 -c %s > %s && chmod 644 %s"'
+                       % (su, remote, gzr, gzr), timeout=900)
+        else:
+            self.shell('gzip -1 -c %s > %s' % (remote, gzr), timeout=900)
+        gzs = self._dev_size(gzr)
+        if not gzs:
+            raise AdbError("压缩失败：设备上没有 %s（空间不够？）" % gzr)
+        tmp = local + ".gz"
+        d = os.path.dirname(tmp)
+        if d:
+            os.makedirs(d, exist_ok=True)
+        self.pull(gzr, tmp, expect_size=gzs)
+        try:
+            with _gzip.open(tmp, "rb") as f, open(local, "wb") as o:
+                shutil.copyfileobj(f, o, 1 << 20)
+        finally:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            try:
+                self.shell("rm -f %s" % gzr, timeout=20)
+            except Exception:
+                pass
+        got = os.path.getsize(local)
+        if expect_size and got != expect_size:
+            raise AdbError("解压后 %d 字节，应为 %d" % (got, expect_size))
+        return local
+
+    def _pull_chunked(self, remote, local, size, chunk, tries=12):
+        """
+        分块拉取：设备上 split → 逐块 pull（大小精确校验 + 重试）→ 本地合并。
+
+        重试次数给到 12 不是保守，是实测值：同一台机器同一批 4 MB 块，
+        有的块一次就过，有的要第 5 次才成（记录里 q_aa=5、q_ae=3）。
+        每块之间歇 0.5 s、失败后歇 3 s 再重连，比连续猛拉成功率高得多。
+        """
+        base = os.path.basename(remote).replace(".", "_")
+        devdir = "/data/local/tmp/_pull_%s_%d" % (base, os.getpid())
+        self.shell("rm -rf %s && mkdir -p %s" % (devdir, devdir), timeout=30)
+
+        rc, out, err = self.run(
+            ["shell", 'split -b %d "%s" "%s/part_" 2>&1' % (chunk, remote, devdir)],
+            timeout=600)
+        parts = sorted(x for x in self.shell("ls %s 2>/dev/null" % devdir, timeout=20).split() if x)
+        if rc != 0 or not parts:
+            # toybox 的 split 有的版本不认纯字节数，退回 -b Nm
+            self.run(["shell", 'split -b %dm "%s" "%s/part_" 2>&1'
+                      % (chunk >> 20, remote, devdir)], timeout=600)
+            parts = sorted(x for x in self.shell("ls %s 2>/dev/null" % devdir, timeout=20).split() if x)
+        if not parts:
+            raise AdbError("分块失败：设备上没有产出 part_*（split 不可用？）")
+
+        tmp = local + ".parts"
+        os.makedirs(tmp, exist_ok=True)
+        got = 0
+        try:
+            for i, name in enumerate(parts):
+                # 除最后一块，其余都应恰好等于 chunk
+                want = chunk if i < len(parts) - 1 else (size - chunk * (len(parts) - 1))
+                dst = os.path.join(tmp, name)
+                ok = False
+                last = ""
+                for n in range(tries):
+                    try:
+                        rc, out, err = self.run(["pull", "%s/%s" % (devdir, name), dst],
+                                                timeout=300)
+                        last = (err or out).strip().splitlines()
+                        last = last[-1][:120] if last else ("rc=%d" % rc)
+                    except Exception as e:
+                        last = str(e)[:120]
+                    if os.path.isfile(dst) and os.path.getsize(dst) == want:
+                        ok = True
+                        break
+                    if os.path.exists(dst):
+                        os.remove(dst)
+                    time.sleep(3)
+                    self._reconnect()
+                if not ok:
+                    raise AdbError(
+                        "分块拉取失败：第 %d/%d 块（%s 应为 %d 字节）重试 %d 次仍不完整。"
+                        "最后一次：%s"
+                        % (i + 1, len(parts), name, want, tries, last))
+                got += want
+                time.sleep(0.5)
+
+            with open(local, "wb") as f:
+                for name in parts:
+                    with open(os.path.join(tmp, name), "rb") as src:
+                        shutil.copyfileobj(src, f, 1 << 20)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+            try:
+                self.shell("rm -rf %s" % devdir, timeout=30)
+            except Exception:
+                pass
+
+        if got != size:
+            raise AdbError("分块合计 %d 字节，分区是 %d 字节，不完整" % (got, size))
+        if os.path.getsize(local) != size:
+            raise AdbError("合并后 %d 字节，应为 %d" % (os.path.getsize(local), size))
+        return "%d bytes in %d parts" % (got, len(parts))
 
     # -- 上层 ----------------------------------------------------------------
 
@@ -622,7 +993,11 @@ class RootWorker(threading.Thread):
         self.blockers = []
         self.adapted = None      # 适配成功后 Pilot 的结果
         self.dev_fp = None       # 采过一次就存着，部署阶段别再读一遍 12 万行
-        self._stop = threading.Event()
+        # 名字不能叫 self._stop：threading.Thread 内部有个同名方法 _stop()，
+        # is_alive() 收尾时会调它。覆盖成 Event 之后 `w.is_alive()` 直接抛
+        # TypeError: 'Event' object is not callable —— 在 CLI 的
+        # `while w.is_alive()` 第一轮就炸，GUI 那条路不走 is_alive 所以没暴露。
+        self._stop_evt = threading.Event()
         self.info = {}
         self.already_root = None
         self.su_src = None       # 哪个 su 生效的，precheck_root 要用
@@ -643,11 +1018,11 @@ class RootWorker(threading.Thread):
         self.q.put(("progress", max(0.0, min(1.0, v))))
 
     def check_stop(self):
-        if self._stop.is_set():
+        if self._stop_evt.is_set():
             raise StopRequested()
 
     def stop(self):
-        self._stop.set()
+        self._stop_evt.set()
 
     # -- 阶段 1：检测 --------------------------------------------------------
 
@@ -832,6 +1207,17 @@ class RootWorker(threading.Thread):
         if self.already_root == "Magisk":
             head = f"设备已经是 Magisk root（{ver or '版本读不到'}，{src}）"
             if self.with_magisk:
+                # 版本不一致 = 用户明确要换版本（降级 / 升级），这不是"重复打补丁"，
+                # 放行。同版本才拦 —— 那才是真的叠补丁。
+                # ver 的形态是 "31.1:MAGISK:R"，只比冒号前那段。
+                target = MAGISK_VER
+                cur = (ver.split(":", 1)[0] if ver else "")
+                if target and cur and target != cur:
+                    self.skip_exploit = True
+                    self.log("")
+                    self.log(f"  [i] 设备上是 {cur}，工具内置 {target} —— 按版本切换处理，"
+                             f"跳过 exploit，直接重打 boot")
+                    return
                 # 再 patch 一次 boot 是拿"当前已 patch 的镜像"当输入，叠补丁
                 raise AlreadyRooted(
                     head + "\n"
@@ -927,7 +1313,7 @@ class RootWorker(threading.Thread):
             # 适配阶段的进度映射到总进度的 0.10~0.62 这一段，
             # 不映射的话 A/B 槽都抓一遍会把进度条顶到 100% 再往回掉
             progress=lambda v: self.progress(0.10 + 0.52 * max(0.0, min(1.0, v))),
-            stop=self._stop.is_set,
+            stop=self._stop_evt.is_set,
             allow_edl=self.allow_edl,
             dev_fp=self.dev_fp,      # 部署前已经采过指纹，别重复读 12 万行
         )
@@ -1307,26 +1693,35 @@ class RootWorker(threading.Thread):
         # 1) 备份原 boot —— 必须在动分区之前先落到 PC 一份。
         #    只在设备上留一份不算备份：boot 写坏后系统起不来，/data 读不到，
         #    那份文件也就取不出来了（recovery 同样读不到 /data）。
-        adb.shell(f'{su} -c "mkdir -p {DEV_MGK} {DEV_KITS}"', timeout=20)
+        # 目录必须对 shell 可写：adb push 是 shell 身份，root 用默认 umask 建出来是
+        # 755 root:root，push 会报 "remote couldn't create file: Permission denied"。
+        # （第一次能过是因为目录恰好是 shell 建的，第二次就踩。）
+        adb.shell(f'{su} -c "mkdir -p {DEV_MGK} {DEV_KITS} && '
+                  f'chmod 777 {DEV_MGK} {DEV_KITS}"', timeout=20)
         self.log(f"  备份原 boot（{int(size)//1048576} MB，约 20 秒）…")
-        adb.shell(f'{su} -c "dd if={dev} of={DEV_MGK}/stock_boot.img bs=1M"', timeout=600)
+        # ⚠ 文件名绝对不能叫 stock_boot.img：boot_patch.sh 自己在 Stock 分支里
+        #   有 `cat $BOOTIMAGE > stock_boot.img`，再 `rm -f stock_boot.img`。
+        #   输入叫这个名字时，`cat x > x` 先把文件截成 0 字节，紧接着被 rm，
+        #   走到 repack 就是 "openat 'stock_boot.img': No such file or directory"
+        #   → 没产出 new-boot.img。任何版本（含 31.1）的脚本都踩这一条。
+        adb.shell(f'{su} -c "dd if={dev} of={DEV_MGK}/in_boot.img bs=1M"', timeout=600)
         # dd 是 root 身份建的，umask 可能给出 600，shell 拉不动，先放开读
-        adb.shell(f'{su} -c "chmod 644 {DEV_MGK}/stock_boot.img"', timeout=20)
-        bak = adb.shell(f'{su} -c "md5sum {DEV_MGK}/stock_boot.img"', timeout=60).split()
+        adb.shell(f'{su} -c "chmod 644 {DEV_MGK}/in_boot.img"', timeout=20)
+        bak = adb.shell(f'{su} -c "md5sum {DEV_MGK}/in_boot.img"', timeout=60).split()
         if not bak:
             raise AdbError("boot 备份失败（md5 读不到）")
 
         stamp = time.strftime("%Y%m%d_%H%M%S")
         local_bak = os.path.join(backup_dir(), f"stock_boot{slot}_{stamp}.img")
         self.log("  拉回 PC 留档…")
-        adb.pull(f"{DEV_MGK}/stock_boot.img", local_bak)
+        adb.pull_gz(f"{DEV_MGK}/in_boot.img", local_bak, su=su, expect_size=int(size))
         lb = md5_of(local_bak)
         if lb != bak[0]:
             raise AdbError(f"备份校验失败：设备 {bak[0]} != 本地 {lb}，已中止（分区未改动）")
         hb = boot_hdr(local_bak)
         if not hb:
             raise AdbError("备份不是合法 boot 镜像（缺 ANDROID! 魔数），已中止（分区未改动）")
-        self.log(f"  stock_boot.img md5={lb}  {hb['size']//1048576} MB")
+        self.log(f"  in_boot.img md5={lb}  {hb['size']//1048576} MB")
         self.log(f"  已留档 → {local_bak}")
         self.info["stock_boot"] = local_bak
 
@@ -1348,7 +1743,7 @@ class RootWorker(threading.Thread):
             self.log("  跑 boot_patch.sh（30~90 秒）…")
             cmd = (f'cd {DEV_MGK} && cp -f {DEV_KITS}/* . && chmod 755 * && '
                    f'KEEPVERITY=true KEEPFORCEENCRYPT=true PATCHVBMETAFLAG=false '
-                   f'BOOTMODE=false sh boot_patch.sh stock_boot.img')
+                   f'BOOTMODE=false sh boot_patch.sh in_boot.img')
             rc, out, err = adb.run(["shell", f'{su} -c "{cmd}"'], timeout=420)
             tail = [l for l in (out or err).splitlines() if l.strip()][-4:]
             for l in tail:
@@ -1364,7 +1759,7 @@ class RootWorker(threading.Thread):
             #      或补丁工具版本不对，这时候写进去必砖，必须在 dd 之前拦住。
             adb.shell(f'{su} -c "chmod 644 {DEV_MGK}/new-boot.img"', timeout=20)
             local_new = os.path.join(backup_dir(), f"new-boot{slot}_{stamp}_magisk.img")
-            adb.pull(f"{DEV_MGK}/new-boot.img", local_new)
+            adb.pull_gz(f"{DEV_MGK}/new-boot.img", local_new, su=su)
             hn = boot_hdr(local_new)
             if not hn:
                 raise AdbError("生成的 new-boot.img 不是合法 boot 镜像，已中止（分区未改动）")
@@ -1412,7 +1807,7 @@ class RootWorker(threading.Thread):
 
             # 7) 装 APK
             self.log("  安装 Magisk App…")
-            rc, out, err = adb.run(["install", "-r", "-g", apk], timeout=420)
+            rc, out, err = adb.run(["install", "-r", "-g", "-d", apk], timeout=420)
             line = (out or err).strip().splitlines()
             self.log(f"  {(line[-1] if line else '')[:120]}")
         finally:
@@ -1631,6 +2026,13 @@ def cli_main(args):
     def emit(s=""):
         try:
             print(s, flush=True)
+        except UnicodeEncodeError:
+            # 中文 Windows 控制台是 GBK，打不出的字符换成 ?，别把整行吞掉
+            enc = getattr(sys.stdout, "encoding", None) or "gbk"
+            try:
+                print(s.encode(enc, "replace").decode(enc, "replace"), flush=True)
+            except Exception:
+                pass
         except Exception:
             pass
         logf.write(s.replace("\n", " ") + "\n")
@@ -1690,6 +2092,37 @@ def cli_main(args):
         emit(f"[=] {r['stage']}: {r['detail']}")
         return 0 if r.get("ok") else 1
 
+    if args.grant_list or args.grant or args.revoke:
+        try:
+            su = su_probe(adb)
+            if not su:
+                emit("[-] 没有能拿到 uid=0 的 su，先跑 --check 看 root 状态")
+                return 2
+            if args.grant_list:
+                rows = list_policies(adb, su)
+                emit("== Magisk 授权表（%d 行） ==" % len(rows))
+                if not rows:
+                    emit("  （空）—— 这时任何 app 执行 su 都会被拒")
+                for uid, pol, until, lg, nt in rows:
+                    emit("  uid=%-6d %s" % (uid, describe_policy(pol)))
+                return 0
+            raw = args.revoke or args.grant
+            if raw.strip().lower() == "all":
+                pkgs = third_party_pkgs(adb)
+                emit("[i] 目标：全部第三方 app（%d 个）" % len(pkgs))
+            else:
+                pkgs = [p.strip() for p in raw.split(",") if p.strip()]
+            if not pkgs:
+                emit("[-] 没给包名")
+                return 2
+            okn, _ = grant_pkgs(adb, pkgs, revoke=bool(args.revoke), log=emit)
+            emit("")
+            emit("完成：%d/%d" % (okn, len(pkgs)))
+            return 0 if okn == len(pkgs) else 1
+        except AdbError as e:
+            emit("[-] %s" % e)
+            return 2
+
     if args.check:
         w = RootWorker(adb, tries=1, q=q, do_deploy=False, do_detect=True)
 
@@ -1735,6 +2168,24 @@ def cli_main(args):
             ok = bool(rest[0])
             break
     emit("")
+    if ok:
+        # v31.1 起 daemon 不再发 request、app 也删了 SuRequestActivity，
+        # 「弹框点允许」这条链彻底没了；v31.0 及以前都还在。
+        # 提示要按内置版本给，否则刷 31.0 还叫用户去 --grant 是错的。
+        def _vnum(s):
+            try:
+                return tuple(int(x) for x in s.split(".")[:2])
+            except ValueError:
+                return (0, 0)
+        has_popup = _vnum(MAGISK_VER) < (31, 1)
+        if has_popup:
+            emit(f"[i] 刷机完成：Magisk {MAGISK_VER}（请求 su 会弹授权框，点「允许」即可）")
+        else:
+            emit(f"[i] 刷机完成：Magisk {MAGISK_VER}。这个版本没有授权弹框，"
+                 f"app 侧要用 root 必须写一次授权表：")
+            emit("      %s --grant <包名>        授权单个 app" % os.path.basename(sys.argv[0]))
+            emit("      %s --grant all           授权所有第三方 app" % os.path.basename(sys.argv[0]))
+            emit("      %s --grant-list          查看当前授权表" % os.path.basename(sys.argv[0]))
     emit(f"结束，日志已存 {logpath}")
     return 0 if ok else 1
 
@@ -3298,6 +3749,15 @@ def main():
     ap.add_argument("--sysadmin", action="store_true", help="要求 CAP_SYS_ADMIN")
     ap.add_argument("--magisk", action="store_true", help="顺手装 Magisk（会 patch boot 并重启）")
     ap.add_argument("--module", action="store_true", help="装/更新 AMS 修复模块")
+    ap.add_argument("--grant", default=None, metavar="PKG[,PKG]|all",
+                    help="把 app 写进 Magisk 超级用户授权表（Allow）。"
+                         "Magisk 31.1 起不再弹授权框，不写这张表 app 执行 su 一律 "
+                         "Permission denied；31.0 及更早会弹框，这条用于批量/免点。"
+                         "all = 所有第三方 app")
+    ap.add_argument("--revoke", default=None, metavar="PKG[,PKG]|all",
+                    help="从授权表里删掉（收回 root）")
+    ap.add_argument("--grant-list", action="store_true",
+                    help="只打印当前授权表，不改动")
     ap.add_argument("--auto", action="store_true",
                     help="全自动：等设备 → 匹配载荷 → 失败自动适配 → （带 --magisk）装 Magisk")
     ap.add_argument("--no-edl", action="store_true",
@@ -3389,7 +3849,12 @@ def main():
             pass
         return rc
 
-    if args.check or args.root or args.auto or args.gplay:
+    # --grant / --revoke / --grant-list 是纯 CLI 动作，不该因为没 tk 就走 GUI 分支。
+    # --magisk / --module 同理：它们带的是「刷 boot 并重启」这种长动作，
+    # 走 GUI 只会弹个窗口什么都不显示（实测），必须留在 CLI。
+    if (args.check or args.root or args.auto or args.gplay
+            or args.grant or args.revoke or args.grant_list
+            or args.magisk or args.module):
         attach_console()
         return cli_main(args)
     return gui_main(args.port)

@@ -29,14 +29,14 @@ GP_NAME = "Leaf5RootTool_gplay"
 # 换成自签名证书后，别人从 EXE 里能读到的只有这一个名字，不含公司名/个人信息。
 # 想换：set LEAF5_SIGN_CN=CN=你自己的名字 后跑 --sign，或改这里重新生成证书。
 SIGN_CN = "SWT"
-VERSION = (1, 1, 12, 0)
+VERSION = (1, 1, 14, 0)
 
 # fastboot.exe 和 adb 共用 AdbWinApi.dll / AdbWinUsbApi.dll，一起进 assets/adb。
 # 它只给「fastbootd 刷 boot」用：ONYX 的 abl 裁掉了 bootloader 模式的 flash，
 # 但跟 fastbootd 的写入是两套实现，所以要有 fastboot 命令行才能走那条路。
 ADB = ["adb.exe", "AdbWinApi.dll", "AdbWinUsbApi.dll", "fastboot.exe"]
 PAYLOAD = ["preload.so", "device_root.sh"]
-MAGISK = ["Magisk-v31.1.apk"]
+MAGISK = ["Magisk-v31.0.apk"]
 # firehose programmer：lito 平台。没有它 9008 通路直接断。
 # moto 排第一 = 主用件：MaxPayload 1MB，program 可用（实测 96MB/3.92s）。
 # op 版是 OnePlus 的受限构建，MaxPayload 只有 16KB 且 program 被

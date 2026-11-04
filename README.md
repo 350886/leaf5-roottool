@@ -89,7 +89,7 @@ Tab8C / Tab8 / Tab10 **没有对应的 EXE**。那三台的原厂包已经全部
 （不是红色失败 —— 一个字节都没写设备）。
 
 ```
-  设备已经是 Magisk root（31.1:MAGISK:R，/debug_ramdisk/su），重启后依然有效，
+  设备已经是 Magisk root（31.0:MAGISK:R，/debug_ramdisk/su），重启后依然有效，
   没有必要再跑一遍。
 ```
 
@@ -363,7 +363,7 @@ Magisk 持久化（基本别指望）。
 
 | 设备 | 是否 root | 依据 | 怎么测的 |
 |---|---|---|---|
-| Leaf5（`e913138`） | **是** | `id` → `uid=0(root)`、`context=u:r:magisk:s0`；`magisk -v` → `31.1:MAGISK:R`；`su` 在 `/product/bin/su` 与 `/debug_ramdisk/su` | 只读命令（`--check`） |
+| Leaf5（`e913138`） | **是** | `id` → `uid=0(root)`、`context=u:r:magisk:s0`；`magisk -v` → `31.0:MAGISK:R`（2026-11-04 由 31.1 降级后复测）；`su` 在 `/product/bin/su` 与 `/debug_ramdisk/su` | 只读命令（`--check`） |
 | Tab8 | 未测 | 没有真机 | — |
 | Tab8C | 未测 | 没有真机 | — |
 | Tab10 | 未测 | 没有真机 | — |
@@ -833,7 +833,18 @@ Leaf5RootTool.exe --root 3 --module   只装 AMS 修复模块（Magisk 已装）
 Leaf5RootTool.exe --payload <zip>     从官方 OTA 抽原厂 boot.img（不需要设备）
 Leaf5RootTool.exe --force-model       型号/内核不匹配时仍然继续（偏移自己负责）
 Leaf5RootTool.exe --port 5053         指定 adb server 端口
+Leaf5RootTool.exe --grant com.foo.bar 直接把 root 授权写进 policies（免点弹框）
+Leaf5RootTool.exe --grant all         给所有已装第三方 app 授权
+Leaf5RootTool.exe --grant-list        看当前 policies 表
+Leaf5RootTool.exe --revoke com.foo.bar 收回授权
 ```
+
+`--grant` 走的是 `su -c 'magisk --sqlite "insert or replace into policies ..."'`，
+写完读回自证。设备上得先有能用的 `su`（本工具刷完就有）。**31.0** 上
+`su` 会弹「授予本装置使用 Root 权限」，点一次「授予：永久」即可（`SuRequestActivity`
+在 v26.3~v31.0 之间都有）；**31.1 把请求弹框整个删了**（daemon 侧 `app_request()`
+不存，只剩 `app_notify()`），没写过策略的 uid 一律回 EACCES，只能靠 `--grant`
+写库放行 —— 所以工具默认装 **31.0**。
 
 CLI 输出同时写一份 UTF-8 日志到
 `%LOCALAPPDATA%\Leaf5RootTool\logs\cli_*.log`（终端编码不是 UTF-8 时看这个）。
@@ -982,7 +993,7 @@ adb shell getprop ro.boot.slot_suffix
 **2. `boot_b.img` 不是原厂备份，别拿它救命**
 
 `--edl dump` 和内部 dump 出来的 `boot_b`，是**这台机器当前正在跑的那份**。
-已经 root 过的机器，那份 boot 是 Magisk 31.1 patch 过的 ——
+已经 root 过的机器，那份 boot 是 Magisk 31.0 patch 过的 ——
 拿来当"恢复原厂"的基底会把你 Magisk 版本固定在这一版，拿来当"重装 Magisk
 的原料"也不对（Magisk 要在**未 patch** 的 boot 上打补丁，叠着打会出问题）。
 
@@ -1367,7 +1378,7 @@ python tools/fetch_deps.py --no-zadig
 | `assets/adb/AdbWinApi.dll` | 同上（zip 里 `platform-tools/`） | ✅ | `120bef587119c6cb926b86b9be90fdfbce38937588eae28cd91a94ce63c7b965` |
 | `assets/adb/AdbWinUsbApi.dll` | 同上 | ✅ | `6ca69a2ca0e31309c087d288f058977d421ad03500e4c3e1dbd981241a069c60` |
 | `assets/adb/fastboot.exe` | 同上（zip 里 `platform-tools/`） | ✅ | `dd55fef77ab2753b6423f37f39d91cb00ce53ab4539a2431577f07c4abcaa32a` |
-| `assets/magisk/Magisk-v31.1.apk` | [Magisk v31.1](https://github.com/topjohnwu/Magisk/releases/download/v31.1/Magisk-v31.1.apk) | ✅ | `89cefac0a318afa39fb3880c45c87b036c05bc1ebf02a7a715b7f8d7c26ac6e7` |
+| `assets/magisk/Magisk-v31.0.apk` | [Magisk v31.0](https://github.com/topjohnwu/Magisk/releases/download/v31.0/Magisk-v31.0.apk) | ✅ | `2c8a488b9a5293e578e95ae4f07e3c57aba4feec4a52ca4dd852a2692d6dd4e8` |
 | `assets/zadig.exe` | [libwdi v1.5.1 → zadig-2.9.exe](https://github.com/pbatard/libwdi/releases/download/v1.5.1/zadig-2.9.exe) | ✅ 可选 | `4ecaa95df3da3621486a043aef8b3050b8bafe7c901402871e816229ef82039b` |
 | `assets/lito_op_n10_fhprg.bin` | [bkerler/Loaders → op_n10](https://raw.githubusercontent.com/bkerler/Loaders/main/oneplus/0013f0e100515198_2354228eebcbc203_fhprg_op_n10.bin) | ✅ | `6558f49c3a55d0eb7fdd7bb326c9bb22b29f4b6b6316937e847e8b76e11f6ec0` |
 | `assets/lito_moto_fhprg.bin` | [bkerler/Loaders → moto lito](https://raw.githubusercontent.com/bkerler/Loaders/main/lenovo_motorola/0013f0e102e80000_628be3f403d0c67a_fhprg.bin)（文件名前缀就是 HWID `0013f0e1` + OEM `02e8`） | ✅ 可选 | `1b5fa0ac18e3ac136aac184bf36d4ef02ad1819ccadc14214b97ce00326e20c1` |
